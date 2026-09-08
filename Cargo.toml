@@ -3,9 +3,9 @@ name = "poison_wasm_bindgen"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-name = "psn_compiler"
-crate-type = ["cdylib", "rlib"] 
+[[bin]]
+name = "compiler_server"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
