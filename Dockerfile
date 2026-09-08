@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y wget lsb-release software-properties-co
     && ./llvm.sh 22 \
     && apt-get install -y llvm-22-dev libclang-22-dev clang-22 \
     && rm -rf /var/lib/apt/lists/*
+
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 WORKDIR /usr/src/poison_lang_playground
@@ -32,3 +33,4 @@ EXPOSE 10000
 ENV PORT=10000
 
 CMD ["./compiler_server"]
+
