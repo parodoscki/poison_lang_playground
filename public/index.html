@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PSN Language Playground</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background-color: #1e1e1e;
+            color: #abb2bf;
+            font-family: 'Fira Code', 'Courier New', Courier, monospace;
+            overflow: hidden;
+        }
+
+        .navbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background-color: #252526;
+            padding: 10px 20px;
+            height: 50px;
+            border-bottom: 1px solid #2d2d2d;
+        }
+
+        .logo {
+            font-weight: bold;
+            color: #61afef;
+            font-size: 16px;
+            letter-spacing: 1px;
+        }
+
+        .status {
+            font-size: 12px;
+            color: #5c6370;
+        }
+
+        .workspace {
+            display: flex;
+            flex: 1;
+            height: calc(100vh - 50px);
+            width: 100%;
+        }
+
+        .pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            position: relative;
+        }
+
+        .pane-left {
+            border-right: 1px solid #2d2d2d;
+        }
+
+        .pane-header {
+            background-color: #21252b;
+            padding: 8px 15px;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #d7dae0;
+            font-weight: 600;
+            border-bottom: 1px solid #181a1f;
+        }
+
+        textarea {
+            flex: 1;
+            width: 100%;
+            height: 100%;
+            padding: 20px;
+            background-color: #1e1e1e;
+            color: #abb2bf;
+            border: none;
+            resize: none;
+            outline: none;
+            font-family: inherit;
+            font-size: 15px;
+            line-height: 1.5;
+            tab-size: 4;
+        }
+
+        pre {
+            flex: 1;
+            width: 100%;
+            height: 100%;
+            padding: 20px;
+            background-color: #181a1f;
+            color: #98c379;
+            font-family: inherit;
+            font-size: 15px;
+            line-height: 1.5;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .compiling {
+            color: #e5c07b !important;
+            font-style: italic;
+        }
+
+        .error {
+            color: #e06c75 !important;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="navbar">
+        <div class="logo">PSN ➔ LLVM IR PLAYGROUND</div>
+        <div id="connection-status" class="status">Connected to Render Backend</div>
+    </div>
+
+    <div class="workspace">
+        
+        <div class="pane pane-left">
+            <div class="pane-header">PSN Source Code</div>
+            <textarea id="editor" autofocus placeholder="Write your custom PSN code routines here..."></textarea>
+        </div>
+
+        <div class="pane">
+            <div class="pane-header">Emitted LLVM IR</div>
+            <pre id="output">Emitted LLVM assembly documentation text will appear here live...</pre>
+        </div>
+
+    </div>
+
+    <script>
+        const editor = document.getElementById('editor');
+        const output = document.getElementById('output');
+        const statusText = document.getElementById('connection-status');
+        
+        let typingTimer;
+        const DEBOUNCE_DELAY_MS = 400;
+
+        async function sendCodeToCompiler(psnCode) {
+            if (!psnCode.trim()) {
+                output.textContent = "Emitted LLVM assembly documentation text will appear here live...";
+                output.className = "";
+                return;
+            }
+
+            output.textContent = "Processing compiler engine pipelines on Render...";
+            output.className = "compiling";
+
+            try {
+                const response = await fetch('/compile', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ code: psnCode })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP network error: status ${response.status}`);
+                }
+
+                const data = await response.json();
+                output.textContent = data.llvm_ir;
+                
+                if (data.llvm_ir.includes("Compilation Error")) {
+                    output.className = "error";
+                } else {
+                    output.className = "";
+                }
+
+            } catch (err) {
+                console.error(err);
+                output.textContent = `Execution Error: Unable to communicate with the compiler backend.\nDetails: ${err.message}`;
+                output.className = "error";
+            }
+        }
+
+        editor.addEventListener('input', () => {
+            clearTimeout(typingTimer);
+            typingTimer = setTimeout(() => {
+                sendCodeToCompiler(editor.value);
+            }, DEBOUNCE_DELAY_MS);
+        });
+
+        editor.addEventListener('keydown', (e) => {
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const start = editor.selectionStart;
+                const end = editor.selectionEnd;
+                editor.value = editor.value.substring(0, start) + "    " + editor.value.substring(end);
+                editor.selectionStart = editor.selectionEnd = start + 4;
+            }
+        });
+    </script>
+</body>
+</html>
