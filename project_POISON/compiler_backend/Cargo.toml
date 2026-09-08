@@ -1,0 +1,12 @@
+[package]
+name = "compiler_backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llvm-sys = "221.0.0"
+compiler_frontend = { path = "../compiler_frontend" }
+
+[lib]
+name = "compiler_backend"
+path = "src/lib.rs"  

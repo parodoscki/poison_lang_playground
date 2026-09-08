@@ -12,4 +12,4 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 tower-http = { version = "0.5", features = ["cors"] } # Allows your website frontend to talk to this backend
-lib_helper = {path = "C:\\Users\\SAMSUNG\\Desktop\\projects\\project_POISON\\lib_helper"}
+lib_helper = {path = "./project_POISON/lib_helper"}

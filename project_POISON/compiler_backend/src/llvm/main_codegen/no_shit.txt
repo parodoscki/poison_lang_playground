@@ -1,0 +1,3023 @@
+use crate::llvm::main_codegen::llvm_codegen::CodegenEnv;
+use llvm_sys::{core::*, prelude::LLVMValueRef}; 
+use crate::llvm::main_codegen::llvm_codegen::LLVMBackend;
+use std::{collections::HashMap, ffi::CString};
+use compiler_frontend::{poison_abstract_syntax_tree_nodes::*, poison_semantic_analyzer::poison_symbol_table::*};
+pub struct LLVMWalkerCodeGenerator {
+    pub backend: LLVMBackend,
+    pub env: CodegenEnv,
+    pub global_functions: HashMap<IdentifierId, LLVMValueRef>,
+}
+impl LLVMWalkerCodeGenerator {
+    pub fn new() -> Self {
+        Self {
+            backend: LLVMBackend::new(),
+            env: CodegenEnv::new(),
+            global_functions: HashMap::new(),
+        }
+    }
+    #[inline(always)]
+    fn make_expression(&self, id: u32, left: LLVMValueRef, right: LLVMValueRef, is_float: bool) -> LLVMValueRef {
+        unsafe {
+            if is_float {
+                match id {
+                    0 => LLVMBuildFAdd(self.backend.builder, left, right, b"fadd_tmp\0".as_ptr() as *const _),
+                    1 => LLVMBuildFSub(self.backend.builder, left, right, b"fsub_tmp\0".as_ptr() as *const _),
+                    2 => LLVMBuildFMul(self.backend.builder, left, right, b"fmul_tmp\0".as_ptr() as *const _),
+                    3 => LLVMBuildFDiv(self.backend.builder, left, right, b"fdiv_tmp\0".as_ptr() as *const _),
+                    _ => std::ptr::null_mut()
+                }
+            } else {
+                match id {
+                    0 => LLVMBuildAdd(self.backend.builder, left, right, b"add_tmp\0".as_ptr() as *const _),
+                    1 => LLVMBuildSub(self.backend.builder, left, right, b"sub_tmp\0".as_ptr() as *const _),
+                    2 => LLVMBuildMul(self.backend.builder, left, right, b"mul_tmp\0".as_ptr() as *const _),
+                    3 => LLVMBuildSDiv(self.backend.builder, left, right, b"div_tmp\0".as_ptr() as *const _),
+                    _ => std::ptr::null_mut()
+                }
+            }
+        }
+    }
+    pub fn walk_expression(&mut self, ast: &Ast, expr_id: ExprId) -> LLVMValueRef{
+        unsafe {
+            let expr = &ast.expressions[expr_id.0 as usize];
+            match expr {
+                Expression::Literal { kind, .. } => {
+                    match kind {
+                        LiteralKind::Integer(val) => {
+                            let i32_ty = self.backend.map_id_to_type(2); 
+                            LLVMConstInt(i32_ty, *val as u64, 1)
+                        }
+                        LiteralKind::Float(val) => {
+                    
+                            let f32_ty = self.backend.map_id_to_type(6);
+                            LLVMConstReal(f32_ty, *val)
+                        }
+                        LiteralKind::Boolean(val) => {
+                            let i8_ty = self.backend.map_id_to_type(4);
+                            LLVMConstInt(i8_ty, if *val { 1 } else { 0 }, 0)
+                        }
+                        LiteralKind::String => std::ptr::null_mut(),
+                    }
+                },
+                Expression::Identifier { .. } => {
+                    let name_id = *ast.resolved_expr_identifiers.get_unchecked(expr_id.0 as usize);
+                    
+                    let var_ptr = self.env.lookup(name_id).expect("Codegen Error: Undefined variable lookup.");
+                    
+                    let var_type = LLVMGetAllocatedType(var_ptr);
+                    LLVMBuildLoad2(self.backend.builder, var_type, var_ptr, b"load_tmp\0".as_ptr() as *const _)
+                },
+                Expression::Binary { left, operator, right, .. } => {
+                    let left_val = self.walk_expression(ast, *left);
+                    let right_val = self.walk_expression(ast, *right);
+
+                    let op_id = match operator {
+                        OpKind::Add => 0,
+                        OpKind::Sub => 1,
+                        OpKind::Mul => 2,
+                        OpKind::Div => 3,
+                        _ => 0,
+                    };
+
+                    let is_float = false; 
+
+                    self.make_expression(op_id, left_val, right_val, is_float)
+                },
+                Expression::Unary { operator, right, .. } => {
+                    let right_val = self.walk_expression(ast, *right);
+                    match operator {
+                        OpKind::Sub => {
+                            let zero = LLVMConstInt(LLVMTypeOf(right_val), 0, 1);
+                            LLVMBuildSub(self.backend.builder, zero, right_val, b"neg_tmp\0".as_ptr() as *const _)
+                        }
+                        _ => right_val,
+                    }
+                },
+                Expression::Call { callee, arguments , .. } => {
+                    let callee_expr = ast.expressions.get_unchecked(callee.0 as usize);
+                    
+                    let func_ptr = match callee_expr {
+                        Expression::Identifier { .. } => {
+                            let func_name_id = *ast.resolved_expr_identifiers.get_unchecked(callee.0 as usize);
+                            
+                            // FIX: Pull directly from the global functions registry instead of stack-based env
+                            *self.global_functions.get(&func_name_id)
+                                .expect("Codegen Error: Attempted to call an undefined function.")
+                        }
+                        _ => panic!("Codegen Error: Complex or dynamic function pointers are not supported yet.")
+                    };
+
+                    assert!(!func_ptr.is_null(), "Codegen Error: Target function pointer is null!");
+
+                    // Safely extract the function type signature from the global value pointer
+                    let func_type = unsafe { llvm_sys::core::LLVMGlobalGetValueType(func_ptr) };
+                    assert!(!func_type.is_null(), "Codegen Error: Failed to extract function type signature.");
+
+                    let mut llvm_args = [std::ptr::null_mut(); 16];
+                    let arg_count = arguments.len();
+
+                    if arg_count > 16 {
+                        panic!("Codegen Error: Function call passes {} arguments, exceeding the 16-parameter limit.", arg_count);
+                    }
+
+                    for (i, &arg_id) in arguments.iter().enumerate() {
+                        llvm_args[i] = self.walk_expression(ast, arg_id);
+                    }
+
+                    // Pass std::ptr::null_mut() safely if there are zero arguments to avoid slice-pointer faults
+                    let arg_ptr = if arg_count == 0 { std::ptr::null_mut() } else { llvm_args.as_mut_ptr() };
+
+                    unsafe {
+                        LLVMBuildCall2(
+                            self.backend.builder,
+                            func_type,
+                            func_ptr,
+                            arg_ptr,
+                            arg_count as u32,
+                            b"call_tmp\0".as_ptr() as *const _,
+                        )
+                    }
+                },
+
+            }
+        }
+    }
+    pub fn walk_statement(&mut self, ast: &Ast, stmt_id: StmtId, interner: &Interner) {
+        unsafe {
+            let stmt = &ast.statements[stmt_id.0 as usize];
+            match stmt {
+                Statement::If { condition, then_branch, else_branch, span } => unsafe {
+                    let current_func = self.backend.get_current_function();
+
+                    let check_if_inside_func = current_func.as_ref().expect("Codegen Error: 'if' statement declared outside of a valid function body.");
+                    let cond_value = self.walk_expression(ast, *condition);
+                    let cond_bool = LLVMBuildICmp(
+                        self.backend.builder,
+                        llvm_sys::LLVMIntPredicate::LLVMIntNE,
+                        cond_value,
+                        LLVMConstInt(LLVMTypeOf(cond_value), 0, 0),
+                        b"if_cond_bit\0".as_ptr() as *const _,
+                    );
+
+                    let then_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "then_branch");
+                    let else_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "else_branch");
+                    let merge_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "if_merge");
+
+                    LLVMBuildCondBr(self.backend.builder, cond_bool, then_block, else_block);
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, then_block);
+                    self.env.enter_scope();
+                    for &inner_stmt_id in then_branch {
+                        self.walk_statement(ast, inner_stmt_id, interner);
+                    }
+                    self.env.exit_scope();
+                    if LLVMGetInsertBlock(self.backend.builder) != std::ptr::null_mut() {
+                        LLVMBuildBr(self.backend.builder, merge_block);
+                    }
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, else_block);
+                    self.env.enter_scope();
+                    if let Some(else_stmts) = else_branch {
+                        for &inner_stmt_id in else_stmts {
+                            self.walk_statement(ast, inner_stmt_id, interner);
+                        }
+                    }
+                    self.env.exit_scope();
+                    if LLVMGetInsertBlock(self.backend.builder) != std::ptr::null_mut() {
+                        LLVMBuildBr(self.backend.builder, merge_block);
+                    }
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, merge_block);
+                }
+                Statement::VarDecl {initializer, ..} => {
+                    let initial_value = self.walk_expression(ast, *initializer);
+                    let expected_ty = ast.resolved_var_decl_types.get_unchecked(stmt_id.0 as usize).unwrap_or(Type::I32);
+                    let name_id = *ast.resolved_assignment_targets.get_unchecked(stmt_id.0 as usize);
+
+                    let llvm_ty = self.backend.map_id_to_type(expected_ty.to_backend_id());
+                    let var_name = interner.lookup(name_id).unwrap_or("unnamed_var");
+
+                    let c_var_name = CString::new(var_name).unwrap_or_else(|_| CString::new("unnamed_var").unwrap());
+
+                    let var_ptr = self.backend.var_emitter.make_variable(
+                        self.backend.builder, 
+                        llvm_ty, 
+                        c_var_name.as_ptr(),
+                        initial_value
+                    );
+                    
+                    
+                    self.env.insert(name_id, var_ptr);
+                }
+                Statement::While { condition, body, span } => unsafe {
+                    let current_func = self.backend.get_current_function();
+                    
+                    let check_if_inside_func = current_func.as_ref()
+                                .expect("Codegen Error: 'while' loop declared outside of a valid function body.");
+
+                    let loop_cond_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "while_cond");
+                    let loop_body_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "while_body");
+                    let loop_end_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "while_end");
+
+                    LLVMBuildBr(self.backend.builder, loop_cond_block);
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, loop_cond_block);
+                    let cond_value = self.walk_expression(ast, *condition);
+                    let cond_boolean = LLVMBuildICmp(
+                        self.backend.builder, 
+                        llvm_sys::LLVMIntPredicate::LLVMIntNE, 
+                        cond_value, 
+                        LLVMConstInt(LLVMTypeOf(cond_value), 0, 0), 
+                        b"w_bit\0".as_ptr() as *const _
+                    );
+                    LLVMBuildCondBr(self.backend.builder, cond_boolean, loop_body_block, loop_end_block);
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, loop_body_block);
+                    self.env.enter_scope();
+                    for &inner_stmt_id in body {
+                        self.walk_statement(ast, inner_stmt_id, interner);
+                    }
+                    self.env.exit_scope();
+                    
+                    if LLVMGetInsertBlock(self.backend.builder) != std::ptr::null_mut() {
+                        LLVMBuildBr(self.backend.builder, loop_cond_block);
+                    }
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, loop_end_block);
+                }
+
+                Statement::Assignment { target, operator, value, span } => {
+                    let new_value = self.walk_expression(ast, *value);
+
+                    let target_name_id = ast.resolved_assignment_targets[stmt_id.0 as usize];
+
+                    let var_ptr = self.env.lookup(target_name_id).unwrap_or_else(|| {
+                        panic!("Poison.CodegenError: Attempted to assign to an undefined variable.");
+                    });
+
+                    match operator {
+                        OpKind::Assign => {
+                            LLVMBuildStore(self.backend.builder, new_value, var_ptr);
+                        }
+                        _ => {
+                            panic!("Poison.CodegenError: Compound assignments are not implemented yet.");
+                        }
+                    }
+                }
+                Statement::Function { body, .. } => {
+                    let func_name_id = ast.resolved_function_names
+                        .get(stmt_id.0 as usize)
+                        .copied()
+                        .expect("Poison.CodegenError: Missing function name ID");
+
+                    let params_meta = ast.resolved_function_params
+                        .get(stmt_id.0 as usize)
+                        .expect("Poison.CodegenError: Missing function parameters metadata");
+                    let func_name = interner.lookup(func_name_id).unwrap_or("unnamed_func");
+                    
+                    let mut param_types = [std::ptr::null_mut(); 64];
+                    let mut param_names = [""; 64]; 
+
+                    if params_meta.len() > 64 {
+                        panic!("Poison.CodegenError: Function '{}' exceeds the 64 parameter limit.", func_name);
+                    }
+
+                    for (i, &(param_id, ty)) in params_meta.iter().enumerate() {
+                        param_types[i] = self.backend.map_id_to_type(ty.to_backend_id());
+                        param_names[i] = interner.lookup(param_id).unwrap_or("param");
+                    }
+
+                    let return_type: Type = ast.resolved_var_decl_types
+                        .get(stmt_id.0 as usize)
+                        .and_then(|inner_option| inner_option.clone()) // Extracts the inner Option<Type>
+                        .unwrap_or(Type::Void);
+
+                    let llvm_ret_ty: *mut llvm_sys::LLVMType = self.backend.map_id_to_type(return_type.to_backend_id());
+
+                    let (function, entry_block) = self.backend.func_emitter.add_function(
+                        self.backend.module,
+                        self.backend.context,
+                        self.backend.builder,
+                        llvm_ret_ty,
+                        &mut param_types[..params_meta.len()],
+                        &param_names[..params_meta.len()],
+                        func_name
+                    );
+
+                    // Make sure the builder is properly placed at the entry block
+                    LLVMPositionBuilderAtEnd(self.backend.builder, entry_block);
+
+
+                    // This leaves the function registered in the global scope frame forever.
+                    self.global_functions.insert(func_name_id, function);
+                    
+                    self.env.enter_scope();
+                    
+                    let c_param_names: Vec<CString> = param_names[..params_meta.len()]
+                        .iter()
+                        .map(|&p_name| CString::new(p_name).unwrap_or_else(|_| CString::new("param").unwrap()))
+                        .collect();
+
+                    for (i, &(param_id, ty)) in params_meta.iter().enumerate() {
+                        let llvm_param_val = LLVMGetParam(function, i as u32);
+                        let llvm_param_ty = param_types[i];
+                        
+                        let var_ptr = self.backend.var_emitter.make_variable(
+                            self.backend.builder,
+                            llvm_param_ty,
+                            c_param_names[i].as_ptr(),
+                            llvm_param_val
+                        );
+                        
+                        self.env.insert(param_id, var_ptr);
+                    }
+
+                    for &inner_stmt_id in body {
+                        self.walk_statement(ast, inner_stmt_id, interner); 
+                    }
+                    
+                    drop(c_param_names);
+                    self.env.exit_scope();
+                }
+
+
+                Statement::Return{value, ..} => {
+                    if let Some(expr_id) = value {
+                        let return_val = self.walk_expression(ast, *expr_id);
+                        
+                        LLVMBuildRet(self.backend.builder, return_val);
+                    } else {
+                        LLVMBuildRetVoid(self.backend.builder);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+use crate::{poison_abstract_syntax_tree_nodes::*, poison_lexer::*,poison_tokens::*};
+#[allow(unused)]
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    ExpectedToken { expected: TokensKind, found: TokensKind },
+    ExpectedExpression,
+    ExpectedTypeSignature,
+    InvalidGlobalStatement,
+    InvalidLiteral,
+    UnterminatedBlock,
+    InvalidAssignmentOperator,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ParseError {
+    pub kind: ErrorKind,
+    pub span: Span,
+}
+
+pub struct Parser<'a> {
+    pub lexer: Lexer<'a>,
+    pub current_token: Token,
+    pub peek_token: Token,
+    pub tokens_trace: Vec<Token>, 
+    pub errors: Vec<ParseError>,
+}
+impl<'a> Parser<'a> {
+    #[inline(always)]
+    pub fn new(mut lexer: Lexer<'a>) -> Self {
+        let current_token = lexer.next_token();
+        let peek_token = lexer.next_token();
+        Self{
+            lexer,
+            current_token,
+            peek_token,
+            errors: Vec::new(),
+            tokens_trace: Vec::with_capacity(1024), 
+        }
+    }
+    #[inline(always)]
+    pub fn report_errors(&self) {
+        for err in &self.errors {
+            match err.kind {
+                ErrorKind::ExpectedToken { expected, found } => {
+                    println!(
+                        "Poison.SyntaxError: Expected token '{:?}' but found '{:?}' at position {}",
+                        expected, found, err.span.start
+                    );
+                }
+                ErrorKind::ExpectedTypeSignature => {
+                    println!("Poison.SyntaxError: Missing or invalid type definition at position {}", err.span.start);
+                }
+                // Map the remaining variants smoothly...
+                _ => println!("Poison.SyntaxError at position {}", err.span.start),
+            }
+        }
+    }
+    #[inline(always)]
+    fn advance(&mut self) {
+        self.tokens_trace.push(self.current_token);
+        self.current_token = std::mem::replace(&mut self.peek_token, self.lexer.next_token());
+    }
+    #[inline(always)]
+    fn parse_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError>{
+        match self.current_token.kind {
+            TokensKind::KeywordInit | TokensKind::KeywordDec => self.parse_var_or_dec(ast),
+            TokensKind::KeywordWhile => self.parse_while_statement(ast),
+            TokensKind::KeywordIf => self.parse_if_statement(ast),
+            TokensKind::KeywordStructure => self.parse_structure_statement(ast),
+            TokensKind::KeywordReturn => self.parse_return_statement(ast),
+            TokensKind::HashTag => self.parse_connect_statement(ast),
+            TokensKind::KeywordFunc => self.parse_func_statement(ast),
+            TokensKind::KeywordFor => self.parse_for_loop_statement(ast),
+            TokensKind::Lbrace => self.parse_block_statement(ast),
+            _ => self.parse_expression_or_assignment(ast),
+        }
+    }
+    #[inline(always)]
+    pub fn parse_program(&mut self, ast: &mut Ast) -> Vec<StmtId> {
+        let mut root_statements = Vec::new();
+        while self.current_token.kind != TokensKind::Eof {
+            match self.parse_global_declaration(ast) {
+                Ok(stmt_id) => {
+                    root_statements.push(stmt_id);
+                }
+                Err(err) => {
+                    self.errors.push(err);
+                    self.synchronize();
+                }
+            }
+        }
+        root_statements
+    }
+
+    #[inline(always)]
+    fn parse_global_declaration(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        match self.current_token.kind {
+            TokensKind::KeywordFunc => self.parse_func_statement(ast),
+            TokensKind::KeywordStructure => self.parse_structure_statement(ast),
+            TokensKind::HashTag => self.parse_connect_statement(ast),
+            
+            TokensKind::KeywordReturn | TokensKind::KeywordWhile | 
+            TokensKind::KeywordFor    | TokensKind::KeywordIf => {
+                Err(ParseError {
+                    kind: ErrorKind::InvalidGlobalStatement,
+                    span: self.current_token.span,
+                })
+            }
+            
+            _ => {
+                Err(ParseError {
+                    kind: ErrorKind::InvalidGlobalStatement,
+                    span: self.current_token.span,
+                })
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn error<T>(&self, kind: ErrorKind) -> Result<T, ParseError> {
+        Err(ParseError {
+            kind,
+            span: self.current_token.span,
+        })
+    }
+    fn parse_block_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        self.advance(); // advance over '{'
+
+        let mut statements = Vec::new();
+        while self.current_token.kind != TokensKind::Rbrace &&
+            self.current_token.kind != TokensKind::Eof {
+                match self.parse_statement(ast) {
+                    Ok(id) => {
+                        statements.push(id);
+                    },
+                    Err(parse_error) => {
+                        self.errors.push(parse_error);
+                        self.synchronize();
+                    },
+                }
+        }
+
+        let end_span = self.current_token.span;
+        if self.current_token.kind != TokensKind::Rbrace {
+            return Err(
+                ParseError {
+                    kind: ErrorKind::UnterminatedBlock,
+                    span: Span { start: start_span.start, end: end_span.end },
+                }
+            );
+        }
+        let stmtid = ast.add_statement(Statement::Block { 
+            statements, 
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            }
+        });
+        Ok(stmtid)
+    }
+    fn parse_for_loop_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        self.advance(); // advance over 'for'
+
+        if self.current_token.kind != TokensKind::Lbracket {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbracket, 
+                found: self.current_token.kind 
+            });
+        }
+        self.advance(); // advance over '['
+
+        if self.current_token.kind != TokensKind::Identifier {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Identifier, 
+                found: self.current_token.kind 
+            });
+        }
+
+        let variable = self.current_token.span;
+        self.advance(); // advance over identifier, example: for [(identifier) in 0..=40] {}
+
+        if self.current_token.kind != TokensKind::KeywordIn {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::KeywordIn, 
+                found: self.current_token.kind 
+            });
+        }
+        self.advance(); // advance over 'in' keyword, example: for [i (in) 0..40]
+
+        let range_start = self.parse_expression(ast, Precedence::Lowest)?;
+
+        let is_inclusive = match self.current_token.kind {
+            TokensKind::KeywordDotDot => {
+                self.advance();
+                false
+            }
+            TokensKind::KeywordDotDotEqual => {
+                self.advance();
+                true
+            }
+            _ => {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::TypeRange, 
+                    found: self.current_token.kind 
+                });
+            }
+        };
+
+        let range_end = self.parse_expression(ast, Precedence::Lowest)?;
+        let end_anchor = self.get_expr_span(ast, range_end);
+
+        let step_by = if self.current_token.kind == TokensKind::Comma {
+            self.advance(); // step over ,
+            
+            if self.current_token.kind != TokensKind::KeywordStep {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::KeywordStep, 
+                    found: self.current_token.kind 
+                });
+            }
+            self.advance(); // step over 'step' keyword
+
+            self.parse_expression(ast, Precedence::Lowest)?
+        } else {
+            ast.add_expression(Expression::Literal {
+                kind: LiteralKind::Integer(1),
+                span: Span { start: end_anchor.end, end: end_anchor.end },
+            })
+        };
+        if self.current_token.kind != TokensKind::Rbracket {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbracket, 
+                found: self.current_token.kind 
+            });
+        }
+        self.advance(); // step over ']'
+
+        if self.current_token.kind != TokensKind::Lbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbrace, 
+                found: self.current_token.kind 
+            });
+        }
+        self.advance(); // step over '{'
+
+        let mut body = Vec::new();
+        while self.current_token.kind != TokensKind::Rbrace && self.current_token.kind != TokensKind::Eof {
+            let stmt_id = self.parse_statement(ast)?;
+            body.push(stmt_id);
+        }
+
+        if self.current_token.kind != TokensKind::Rbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbrace, 
+                found: self.current_token.kind 
+            });
+        }
+        let end_span = self.current_token.span;
+        self.advance(); // step over '}'
+
+        let stmt_id = ast.add_statement(Statement::For {
+            variable,
+            range_start,
+            range_end,
+            is_inclusive,
+            step_by,
+            body,
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            },
+        });
+        Ok(stmt_id)
+    }
+
+
+
+
+    fn synchronize(&mut self) {
+        self.advance(); // skip past the token that caused the current syntax error
+        
+        while self.current_token.kind != TokensKind::Eof {
+            if self.current_token.kind == TokensKind::Semicolon {
+                self.advance();
+                return;
+            }
+        
+            match self.current_token.kind {
+                TokensKind::KeywordFunc | TokensKind::KeywordStructure |
+                TokensKind::KeywordIf   | TokensKind::KeywordWhile |
+                TokensKind::KeywordInit | TokensKind::KeywordDec |
+                TokensKind::KeywordFor  | TokensKind::KeywordReturn => return,
+                _ => self.advance(), // Discard everything else
+            }
+        }
+    }
+    // parse_func would not be called directly, only in parse program
+
+
+    fn parse_func_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        self.advance(); // steps over keyword func
+
+        // supported attributes: @main @gpu @bare_metal
+        let mut function_attribute = None;
+        let name_span;
+        let mut parameters = Vec::new();
+
+        if self.current_token.kind == TokensKind::At {
+            self.advance(); // steps over @
+
+            if self.current_token.kind != TokensKind::Identifier {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Identifier, 
+                    found: self.current_token.kind 
+                });
+            }
+            let span = self.current_token.span;
+
+            let attr_bytes = unsafe { 
+                self.lexer.stream.get_slice(span.start as usize, span.end as usize) 
+            };
+            match attr_bytes.len() {
+                4 if attr_bytes == b"main" => {
+                    function_attribute = Some(span);
+                }
+                10 if attr_bytes == b"bare_metal" => {
+                    function_attribute = Some(span);
+                }
+                3 if attr_bytes == b"gpu" => {
+                    function_attribute = Some(span);
+                }
+                _ => {
+                    return self.error(ErrorKind::ExpectedToken { 
+                        expected: TokensKind::Attribute, 
+                        found: self.current_token.kind 
+                    });
+                }
+            }
+            self.advance(); // step over attribute identifier
+        }
+
+        if self.current_token.kind == TokensKind::Identifier {
+            name_span = self.current_token.span;
+            self.advance();
+        } else if self.current_token.kind == TokensKind::Lparen {
+            if let Some(attr_span) = function_attribute {
+                if self.lexer.get_text(attr_span) == "main" {
+                    name_span = attr_span;
+                } else {
+                    return self.error(ErrorKind::ExpectedToken { 
+                        expected: TokensKind::Identifier, 
+                        found: self.current_token.kind 
+                    });
+                }
+            } else {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Identifier, 
+                    found: self.current_token.kind 
+                });
+            }
+        } else {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Identifier, 
+                    found: self.current_token.kind 
+                });
+        }
+
+        if self.current_token.kind != TokensKind::Lparen {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lparen, 
+                found: self.current_token.kind 
+            });
+        }
+        self.advance(); // step over (
+
+        if self.current_token.kind != TokensKind::Rparen {
+            loop {
+                if self.current_token.kind != TokensKind::Identifier {
+                    return self.error(ErrorKind::ExpectedToken { 
+                        expected: TokensKind::Identifier, 
+                        found: self.current_token.kind 
+                    });
+                }
+                let param_name_span = self.current_token.span;
+                self.advance();
+
+                if self.current_token.kind != TokensKind::Colon {
+                    return self.error(ErrorKind::ExpectedToken { 
+                        expected: TokensKind::Colon, 
+                        found: self.current_token.kind
+                    });
+                }
+                self.advance(); //step over ':'
+
+                if !self.is_type_keyword(self.current_token.kind) {
+                    return self.error(ErrorKind::ExpectedTypeSignature);
+                }
+                parameters.push(
+                    Param {
+                       name: param_name_span,
+                       param_type: self.current_token.span 
+                    }
+                );
+                self.advance();
+
+                if self.current_token.kind == TokensKind::Comma {
+                    self.advance(); // jump over ','
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if self.current_token.kind != TokensKind::Rparen {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rparen, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance(); // step over ')'
+
+        let mut return_type = None;
+        if self.current_token.kind == TokensKind::Colon {
+            self.advance(); // step over ':'
+            
+            if !self.is_type_keyword(self.current_token.kind) {
+                return self.error(
+                    ErrorKind::ExpectedTypeSignature
+                );
+            }
+
+            return_type = Some(self.current_token.span);
+            self.advance(); // step over return type identifier
+        }
+        if self.current_token.kind != TokensKind::Lbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbrace, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance(); // step over '{'
+
+        let mut body = Vec::new();
+        while self.current_token.kind != TokensKind::Rbrace && self.current_token.kind != TokensKind::Eof {
+            let stmt_id = self.parse_statement(ast)?;
+            body.push(stmt_id);
+        }
+
+        if self.current_token.kind != TokensKind::Rbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbrace, 
+                found: self.current_token.kind
+            });
+        }
+        let end_span = self.current_token.span;
+        self.advance();
+        let func_stmt = Statement::Function {
+            name: name_span,
+            parameters,
+            body,
+            return_type,
+            attribute: function_attribute,
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            },
+        };
+
+        Ok(ast.add_statement(func_stmt))
+    }
+    fn parse_if_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError>{
+        let start_span = self.current_token.span;
+        self.advance(); // advance over if keyword
+        // if [x > 4] {
+        //    y += 1;
+        // }
+        // while [x > 4] {
+        //    y += 1;
+        // }
+        if self.current_token.kind != TokensKind::Lbracket {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbracket, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance();
+
+        let condition = self.parse_expression(ast, Precedence::Lowest)?;
+
+        if self.current_token.kind != TokensKind::Rbracket {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbracket, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance();
+
+        if self.current_token.kind != TokensKind::Lbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbrace, 
+                found: self.current_token.kind
+            });
+        }
+
+        self.advance();
+        let mut body = Vec::new();
+        while self.current_token.kind != TokensKind::Rbrace && self.current_token.kind != TokensKind::Eof {
+            let stmt_id = self.parse_statement(ast)?;
+            body.push(stmt_id);
+        }
+        if self.current_token.kind != TokensKind::Rbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbrace, 
+                found: self.current_token.kind
+            });
+        }
+        let mut end_span = self.current_token.span;
+        self.advance();
+
+        let mut else_branch = None;
+        if self.current_token.kind == TokensKind::KeywordElse {
+            self.advance();
+            
+            if self.current_token.kind == TokensKind::KeywordIf {
+                let nested_if = self.parse_if_statement(ast)?;
+                else_branch = Some(vec![nested_if]);
+            } else if self.current_token.kind == TokensKind::Lbrace {
+                self.advance();
+                let mut else_stmts = Vec::new();
+                while self.current_token.kind != TokensKind::Rbrace && self.current_token.kind != TokensKind::Eof {
+                    let stmt_id = self.parse_statement(ast)?;
+                    else_stmts.push(stmt_id);
+                }
+                if self.current_token.kind != TokensKind::Rbrace {
+                    return self.error(ErrorKind::ExpectedToken { 
+                        expected: TokensKind::Rbrace, 
+                        found: self.current_token.kind
+                    });
+                }
+                end_span = self.current_token.span;
+                self.advance(); // step over '}'
+                else_branch = Some(else_stmts);
+            } else {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Lbrace, 
+                    found: self.current_token.kind
+                });
+            }
+        }
+
+        let stmt_id = ast.add_statement(Statement::If {
+            condition, 
+            then_branch: body, 
+            else_branch: else_branch,
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            } 
+        });
+        Ok(stmt_id)
+    }
+    fn parse_expression(&mut self, ast: &mut Ast,precedence: Precedence) -> Result<ExprId, ParseError>{
+        let mut left_expr = match self.current_token.kind {
+            TokensKind::Identifier => {
+                let expr = ast.add_expression(Expression::Identifier { span: self.current_token.span });
+                self.advance();
+                expr
+            },
+            TokensKind::AmperSand => {
+                let op_span = self.current_token.span;
+                self.advance(); 
+                
+                let right = self.parse_expression(ast, Precedence::Product)?;
+                let end_pos = self.get_expr_span(ast, right).end;
+
+                ast.add_expression(Expression::Unary {
+                    operator: OpKind::AddressOf,
+                    right,
+                    span: Span { start: op_span.start, end: end_pos },
+                })
+            },
+            TokensKind::KeywordTrue => {
+                let expr = ast.add_expression(Expression::Literal {
+                    kind: LiteralKind::Boolean(true),
+                    span: self.current_token.span,
+                });
+                self.advance();
+                expr
+            },
+            TokensKind::KeywordFalse => {
+                let expr = ast.add_expression(Expression::Literal {
+                    kind: LiteralKind::Boolean(false),
+                    span: self.current_token.span,
+                });
+                self.advance();
+                expr
+            },
+            TokensKind::IntegerLiteral => {
+                let raw_text = self.lexer.get_text(self.current_token.span);
+                
+                let value = raw_text.parse::<i64>().map_err(|_| ParseError {
+                    kind: ErrorKind::InvalidLiteral,
+                    span: self.current_token.span,
+                })?;
+                let expr = ast.add_expression(Expression::Literal {
+                    kind: LiteralKind::Integer(value),
+                    span: self.current_token.span,
+                });
+                self.advance();
+                expr
+            },
+            TokensKind::FloatLiteral => {
+                let raw_text = self.lexer.get_text(self.current_token.span);
+                
+                let value = raw_text.parse::<f64>().map_err(|_| ParseError {
+                    kind: ErrorKind::InvalidLiteral,
+                    span: self.current_token.span,
+                })?;         
+                let expr = ast.add_expression(Expression::Literal {
+                    kind: LiteralKind::Float(value),
+                    span: self.current_token.span,
+                });
+                self.advance();
+                expr
+            },
+            TokensKind::StringLiteral => {
+                let expr = ast.add_expression(Expression::Literal {
+                    kind: LiteralKind::String,
+                    span: self.current_token.span,
+                });
+                self.advance();
+                expr
+            },
+            _ =>return self.error(ErrorKind::ExpectedExpression),
+        };
+
+        while self.current_token.kind != TokensKind::Semicolon 
+            && precedence < self.current_precedence()
+            && self.current_token.kind != TokensKind::Rbracket 
+        {
+            match self.current_token.kind {
+                TokensKind::Lparen => {
+                    self.advance(); // Step over '('
+                    
+                    let mut arguments = Vec::new();
+                    if self.current_token.kind != TokensKind::Rparen {
+                        loop {
+                            let arg = self.parse_expression(ast, Precedence::Lowest)?;
+                            arguments.push(arg);
+                            
+                            if self.current_token.kind == TokensKind::Comma {
+                                self.advance(); // Step over ','
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if self.current_token.kind != TokensKind::Rparen {
+                        return self.error(ErrorKind::ExpectedToken { 
+                            expected: TokensKind::Rparen, 
+                            found: self.current_token.kind
+                        });
+                    }
+                    let end_pos = self.current_token.span.end;
+                    self.advance(); // Step over ')'
+                    
+                    let start_pos = self.get_expr_span(ast, left_expr).start;
+                    
+                    left_expr = ast.add_expression(Expression::Call {
+                        callee: left_expr,
+                        arguments,
+                        span: Span { start: start_pos, end: end_pos },
+                    });
+                },
+                TokensKind::Plus | TokensKind::PipePipe | TokensKind::Minus | TokensKind::Asterisk | TokensKind::Slash |
+                TokensKind::EqualEqual | TokensKind::BangEqual | TokensKind::LessThan | 
+                TokensKind::LessThanEqual | TokensKind::GreaterThan | TokensKind::GreaterThanEqual |
+                TokensKind::AndAnd => {
+                    let operator_kind = match self.get_op_kind(self.current_token.kind) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    let operator_precedence = self.current_precedence();
+                    self.advance();
+
+                    let right_expr = self.parse_expression(ast, operator_precedence)?;
+
+                    let start_pos = self.get_expr_span(ast, left_expr).start;
+                    let end_pos = self.get_expr_span(ast, right_expr).end;
+
+                    left_expr = ast.add_expression(Expression::Binary {
+                        operator: operator_kind,
+                        left: left_expr,
+                        right: right_expr,
+                        span: Span { start: start_pos, end: end_pos },
+                    });
+                },
+                _ => break,
+            }
+        }
+        Ok(left_expr)
+    }
+
+
+
+
+
+    fn parse_connect_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        self.advance(); // advance over the hashtag #
+
+        if self.current_token.kind != TokensKind::KeywordConnect {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::KeywordConnect, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance(); // advance over 'connect'
+
+        if self.current_token.kind != TokensKind::Identifier && self.current_token.kind != TokensKind::StringLiteral {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Identifier, 
+                found: self.current_token.kind
+            });
+        }
+        let base_target = self.current_token.span;
+        self.advance(); // advance over the base identifier, for example: #connect (identifier)::some_module
+
+        let mut last_target_span = base_target;
+        while self.current_token.kind == TokensKind::ColonArrow {
+            self.advance();
+            if self.current_token.kind != TokensKind::Identifier {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Identifier, 
+                    found: self.current_token.kind
+                });
+            }
+            last_target_span = self.current_token.span;
+            self.advance();
+        }
+        if self.current_token.kind != TokensKind::Semicolon {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Semicolon, 
+                found: self.current_token.kind
+            });
+        }
+        let end_span = self.current_token.span;
+        self.advance(); // step over ';'
+
+        let stmt_id = ast.add_statement(Statement::Connect {
+            target: Span {
+                start: base_target.start,
+                end: last_target_span.end,
+            },
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            },
+        });
+        Ok(stmt_id)
+    }
+
+
+
+
+    fn get_expr_span(&self, ast: &Ast, id: ExprId) -> Span {
+        match ast.expressions[id.0 as usize] {
+            Expression::Literal { span, .. } => span,
+            Expression::Identifier { span } => span,
+            Expression::Binary { span, .. } => span,
+            Expression::Call { span, .. } => span,
+            Expression::Unary { span, .. } => span,
+        }
+    }
+    #[inline(always)]
+    fn is_type_keyword(&self, kind: TokensKind) -> bool {
+        match kind {
+            TokensKind::KeywordUint64 | TokensKind::KeywordUint32 | TokensKind::KeywordUint16 | TokensKind::KeywordUint8 |
+            TokensKind::KeywordInt64  | TokensKind::KeywordInt32  | TokensKind::KeywordInt16  | TokensKind::KeywordInt8  |
+            TokensKind::KeywordFloat64 | TokensKind::KeywordFloat32 | TokensKind::KeywordFloat16 | TokensKind::KeywordFloat8 |
+            TokensKind::KeywordChar | TokensKind::KeywordBool | TokensKind::KeywordString => true,
+            _ => false,
+        }
+    }
+    fn parse_while_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError>{
+        let start_span = self.current_token.span;
+        self.advance(); // advance over while keyword
+
+        if self.current_token.kind != TokensKind::Lbracket {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbracket, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance();
+
+        let condition = self.parse_expression(ast, Precedence::Lowest)?;
+
+        if self.current_token.kind != TokensKind::Rbracket {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbracket, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance();
+
+        if self.current_token.kind != TokensKind::Lbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbrace, 
+                found: self.current_token.kind
+            });
+        }
+
+        self.advance();
+        let mut body = Vec::new();
+        while self.current_token.kind != TokensKind::Rbrace && self.current_token.kind != TokensKind::Eof {
+            let stmt_id = self.parse_statement(ast)?;
+            body.push(stmt_id);
+        }
+        if self.current_token.kind != TokensKind::Rbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbrace, 
+                found: self.current_token.kind
+            });
+        }
+        let end_span = self.current_token.span;
+        self.advance();
+
+        let stmt_id = ast.add_statement(Statement::While {
+            condition, 
+            body, 
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            } 
+        });
+        Ok(stmt_id)
+    }
+    #[inline(always)]
+    fn current_precedence(&self) -> Precedence {
+        match self.current_token.kind {
+            TokensKind::Lparen => Precedence::Call,
+            TokensKind::AndAnd => Precedence::LogicalAnd,
+            TokensKind::PipePipe => Precedence::LogicalOr,
+            
+            TokensKind::EqualEqual | TokensKind::BangEqual |
+            TokensKind::LessThan   | TokensKind::GreaterThan |
+            TokensKind::LessThanEqual | TokensKind::GreaterThanEqual => Precedence::Comparison,
+            
+            TokensKind::Plus | TokensKind::Minus => Precedence::Sum,
+            TokensKind::Asterisk | TokensKind::Slash => Precedence::Product,
+            
+            _ => Precedence::Lowest,
+        }
+    }
+
+
+
+
+
+
+
+    #[inline(always)]
+    fn is_assignment_operator(&self, kind: TokensKind) -> bool {
+        match kind {
+            TokensKind::Assign | TokensKind::AddBy | 
+            TokensKind::SubtractBy | TokensKind::MultiplyBy | 
+            TokensKind::DivideBy => true,
+            _ => false,
+        }
+    }
+
+
+
+
+
+    fn parse_var_or_dec(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        let mut is_mutable = false;
+        let is_init = self.current_token.kind == TokensKind::KeywordInit;
+        self.advance(); // advance over init or dec
+
+        if self.current_token.kind == TokensKind::KeywordMutable {
+            is_mutable = true;
+        }
+        if self.current_token.kind != TokensKind::Identifier {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Identifier, 
+                found: self.current_token.kind
+            });
+        }
+
+        let name_span = self.current_token.span;
+        self.advance(); // advance over identifier , or "x"
+
+        let mut explicit_type = None;
+        if self.current_token.kind == TokensKind::Colon {
+            self.advance(); // advance over colon (to explicit type setting)
+            if !self.is_type_keyword(self.current_token.kind) {
+                return self.error(ErrorKind::ExpectedTypeSignature);
+            }
+            explicit_type = Some(self.current_token.span);
+            self.advance();
+        }
+        let initializer = if self.current_token.kind == TokensKind::Assign {
+            self.advance();
+            self.parse_expression(ast, Precedence::Lowest)?
+        } else {
+            ast.add_expression(Expression::Literal {
+                kind: LiteralKind::Integer(0), 
+                span: name_span,
+            })
+        };
+        if self.current_token.kind != TokensKind::Semicolon {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Semicolon, 
+                found: self.current_token.kind
+            });
+        }
+
+        let end_span = self.current_token.span;
+        self.advance();
+
+        let stmd_id = ast.add_statement(Statement::VarDecl {
+            is_init,
+            is_mutable,
+            name: name_span,
+            explicit_type,
+            initializer,
+            span: Span {
+                start: start_span.start,
+                end: end_span.end,
+            } 
+        });
+        Ok(stmd_id)
+    }
+
+    fn parse_expression_or_assignment(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        
+        if self.current_token.kind == TokensKind::Identifier &&
+            self.is_assignment_operator(self.peek_token.kind) 
+        {
+            let target = self.current_token.span;
+            self.advance(); // step over identifier, example: (identifier) += 3;
+
+
+            let operator = match self.get_assign_op_kind(self.current_token.kind) {
+                Some(op_type) => op_type,
+                None => {
+                    return self.error(ErrorKind::InvalidAssignmentOperator);
+                },
+            };
+            self.advance(); // step over operator, example: variable
+
+            let value = self.parse_expression(ast, Precedence::Lowest)?;
+
+            if self.current_token.kind != TokensKind::Semicolon {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Semicolon, 
+                    found: self.current_token.kind
+                });
+            }
+            let end_span = self.current_token.span;
+            self.advance();
+
+            let stmt_id = ast.add_statement(Statement::Assignment {
+                target,
+                operator,
+                value,
+                span: Span {
+                    start: start_span.start,
+                    end: end_span.end,
+                },
+            });
+            return Ok(stmt_id);
+        } 
+        
+
+        let expr_id = self.parse_expression(ast, Precedence::Lowest)?;
+        if self.current_token.kind != TokensKind::Semicolon {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Semicolon, 
+                found: self.current_token.kind
+            });
+        }
+        self.advance(); // step over ';'
+
+        let stmt_id = ast.add_statement(Statement::Expression(expr_id));
+        Ok(stmt_id)
+    }
+
+
+
+
+    fn parse_return_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let mut value = None;
+        let start_span = self.current_token.span;
+        self.advance();
+
+        if self.current_token.kind != TokensKind::Semicolon {
+            value = Some(self.parse_expression(ast, Precedence::Lowest)?);
+        }
+
+        if self.current_token.kind != TokensKind::Semicolon {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Semicolon, 
+                found: self.current_token.kind
+            });
+        }
+        let end_span = self.current_token.span;
+        self.advance();
+
+        let stmt_id = ast.add_statement(Statement::Return { 
+            value, 
+            span: Span {
+                start: start_span.start,end: end_span.end
+            } 
+        });
+        Ok(stmt_id)
+    }
+
+    fn parse_structure_statement(&mut self, ast: &mut Ast) -> Result<StmtId, ParseError> {
+        let start_span = self.current_token.span;
+        self.advance();
+
+        if self.current_token.kind != TokensKind::Identifier {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Identifier, 
+                found: self.current_token.kind
+            });
+        }
+
+        let struct_name = self.current_token.span;
+        self.advance();
+
+        if self.current_token.kind != TokensKind::Lbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Lbrace, 
+                found: self.current_token.kind
+            });
+        }
+
+        self.advance();
+        let mut fields: Vec<StructField> = Vec::new();
+        while self.current_token.kind != TokensKind::Rbrace && self.current_token.kind != TokensKind::Eof {
+            let field_start = self.current_token.span;
+            if self.current_token.kind != TokensKind::Identifier {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Identifier, 
+                    found: self.current_token.kind
+                });
+            }
+            let field_name = self.current_token.span;
+            self.advance();
+
+            if self.current_token.kind != TokensKind::Colon {
+                return self.error(ErrorKind::ExpectedToken { 
+                    expected: TokensKind::Colon, 
+                    found: self.current_token.kind
+                });
+            }
+            self.advance();
+
+            if !self.is_type_keyword(self.current_token.kind) {
+                return self.error(ErrorKind::ExpectedTypeSignature);
+            }
+            let field_type = self.current_token.span;
+            let field_end = self.current_token.span;
+            self.advance();
+            fields.push(StructField {
+                name: field_name,
+                field_type,
+                span: Span { start: field_start.start, end: field_end.end },
+            });
+
+            if self.current_token.kind == TokensKind::Comma {
+                self.advance(); // Advance over optional trailing comma
+            }
+        }
+        if self.current_token.kind != TokensKind::Rbrace {
+            return self.error(ErrorKind::ExpectedToken { 
+                expected: TokensKind::Rbrace, 
+                found: self.current_token.kind
+            });
+        }
+        let end_span = self.current_token.span;
+        self.advance();
+
+        let stmt_id = ast.add_statement(Statement::Structure {
+             name: struct_name, fields: fields, span: Span {start: start_span.start, end: end_span.end}
+        });
+        Ok(stmt_id)
+    }
+    #[inline(always)]
+    fn get_op_kind(&self, kind: TokensKind) -> Option<OpKind> {
+        match kind {
+            TokensKind::Plus => Some(OpKind::Add),
+            TokensKind::Minus => Some(OpKind::Sub),
+            TokensKind::Asterisk => Some(OpKind::Mul),
+            TokensKind::Slash => Some(OpKind::Div),
+            TokensKind::EqualEqual => Some(OpKind::Equal),
+            TokensKind::BangEqual => Some(OpKind::NotEqual),
+            TokensKind::LessThan => Some(OpKind::Less),
+            TokensKind::GreaterThan => Some(OpKind::Greater),
+            TokensKind::LessThanEqual => Some(OpKind::LessEqual),
+            TokensKind::GreaterThanEqual => Some(OpKind::GreaterEqual),
+            TokensKind::AndAnd => Some(OpKind::LogicalAnd),
+            TokensKind::PipePipe => Some(OpKind::LogicalOr),
+            _ => None,
+        }
+    }
+    #[inline(always)]
+    fn get_assign_op_kind(&self, kind: TokensKind) -> Option<OpKind> {
+        match kind {
+            TokensKind::Assign => Some(OpKind::Assign),
+            TokensKind::AddBy => Some(OpKind::AddAssign),
+            TokensKind::SubtractBy => Some(OpKind::SubAssign),
+            TokensKind::MultiplyBy => Some(OpKind::MulAssign),
+            TokensKind::DivideBy => Some(OpKind::DivAssign),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
+pub enum Precedence {
+    Lowest,
+    LogicalOr,    // ||
+    LogicalAnd,   // &&
+    Comparison,   // ==, !=, <, >, <=, >=
+    Sum,          // +, -
+    Product,    // *, /
+    Prefix,    // -unary, !unary, &address
+    Call,
+}
+use crate::{poison_semantic_analyzer::poison_symbol_table::Interner, poison_source_stream::SourceStream, poison_tokens::*};
+
+pub struct Lexer<'a> {
+    pub stream: SourceStream<'a>,
+    pub interner: &'a mut Interner,
+}
+impl<'a> Lexer<'a> {
+    #[inline(always)]
+    pub fn new(source: &'a str, interner: &'a mut Interner) -> Self {
+        Self {
+            stream: SourceStream::new(source.as_bytes()),
+            interner,
+        }
+    }
+    #[inline(always)]
+    pub fn get_text(&self, span: Span) -> &'a str {
+        unsafe {
+            let bytes = self.stream.get_slice(span.start as usize, span.end as usize);
+            std::str::from_utf8_unchecked(bytes)
+        }
+    }
+    #[inline(always)]
+    pub fn next_token(&mut self) -> Token {
+        self.stream.skip_whitespace();
+        let start = self.stream.index();
+        let current_byte = match self.stream.advance() {
+            Some(b) => b,
+            None => return Token { kind: TokensKind::Eof, span: Span { start, end: start },id: None },
+        };
+
+        match current_byte {
+            b'*' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::MultiplyBy, span: Span { start, end: start + 2 },id: None};
+                }
+                Token { kind: TokensKind::Asterisk, span: Span { start, end: start + 1 },id: None}
+            },
+            b'+' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::AddBy, span: Span { start, end: start + 2 },id: None};
+                }
+                Token { kind: TokensKind::Plus, span: Span { start, end: start + 1 },id: None}
+            },
+            b'-' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::SubtractBy, span: Span { start, end: start + 2 },id: None};
+                }
+                Token { kind: TokensKind::Minus, span: Span { start, end: start + 1 },id: None}
+            },
+            b'/' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::DivideBy, span: Span { start, end: start + 2 },id: None};
+                }
+                Token { kind: TokensKind::Slash, span: Span { start, end: start + 1 },id: None}
+            },
+            b'@' => Token { kind: TokensKind::At, span: Span { start, end: start + 1 },id: None},
+            b':' => {
+                if self.stream.peek() == Some(b'>') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::ColonArrow, span: Span { start, end: start + 2 },id: None};
+                }
+                Token { kind: TokensKind::Colon, span: Span { start, end: start + 1 },id: None}
+            },
+            b'#' => {
+                //i have to handle #connect in some way
+                // keywordConnect
+                Token { kind: TokensKind::HashTag, span: Span { start, end: start + 1 },id: None}
+            },
+            b',' => Token { kind: TokensKind::Comma, span: Span { start, end: start + 1 },id: None},
+            b';' => Token { kind: TokensKind::Semicolon, span: Span { start, end: start + 1 },id: None},
+
+            b'[' => Token { kind: TokensKind::Lbracket, span: Span { start, end: start + 1 },id: None},
+            b']' => Token { kind: TokensKind::Rbracket, span: Span { start, end: start + 1 },id: None},
+            b'{' => Token { kind: TokensKind::Lbrace, span: Span { start, end: start + 1 },id: None},
+            b'}' => Token { kind: TokensKind::Rbrace, span: Span { start, end: start + 1 },id: None},
+            b'(' => Token { kind: TokensKind::Lparen, span: Span { start, end: start + 1 },id: None},
+            b')' => Token { kind: TokensKind::Rparen, span: Span { start, end: start + 1 },id: None},
+
+            b'"' => self.lex_string_literal(start),
+
+            b'=' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::EqualEqual, span: Span { start, end: start + 2 },id: None}
+                }
+                Token { kind: TokensKind::Assign, span: Span { start, end: start + 1 },id: None}
+            },
+            b'!' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::BangEqual, span: Span { start, end: start + 2 },id: None}
+                }
+                Token { kind: TokensKind::Bang, span: Span { start, end: start + 1 },id: None}
+            },
+            b'.' => {
+                if self.stream.peek() == Some(b'.') {
+                    self.stream.advance();
+                    if self.stream.peek() == Some(b'=') {
+                        self.stream.advance();
+                        return Token { kind: TokensKind::KeywordDotDotEqual, span: Span { start, end: start + 3 },id: None}
+                    }
+                    return Token { kind: TokensKind::KeywordDotDot, span: Span { start, end: start + 2 },id: None}
+                }
+                Token { kind: TokensKind::Dot, span: Span { start, end: start + 1 },id: None}
+            },
+            b'>' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::GreaterThanEqual, span: Span { start, end: start + 2 },id: None}
+                }
+                Token { kind: TokensKind::GreaterThan, span: Span { start, end: start + 1 },id: None}
+            },
+            b'&' => {
+                if self.stream.peek() == Some(b'&') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::AndAnd, span: Span { start, end: start + 2 },id: None}
+                }
+                Token { kind: TokensKind::AmperSand, span: Span { start, end: start + 1 },id: None}
+            },
+
+            b'<' => {
+                if self.stream.peek() == Some(b'=') {
+                    self.stream.advance();
+                    return Token { kind: TokensKind::LessThanEqual, span: Span { start, end: start + 2 },id: None}
+                }
+                Token { kind: TokensKind::LessThan, span: Span { start, end: start + 1 },id: None}
+            },
+
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_identifier_or_keyword(start), // for later,
+            b'0'..=b'9' => self.lex_number(start,current_byte),
+            _ => panic!("Lexer Error: Unexpected byte code '{}'", current_byte as char),
+      }
+    }
+    #[inline(always)]
+    fn lex_string_literal(&mut self, start: usize) -> Token {
+        let base = self.stream.initial_ptr;
+        let len = self.stream.length;
+        let mut idx = self.stream.index;
+
+        let mut escaped = false;
+        
+        while idx < len {
+            let b = unsafe { *base.add(idx) };
+            
+            if escaped {
+                escaped = false;
+                idx += 1;
+                continue;
+            }
+            
+            match b {
+                b'\\' => {
+                    escaped = true;
+                    idx += 1;
+                }
+                b'"' => {
+                    idx += 1;
+                    self.stream.index = idx;
+                    return Token {
+                        kind: TokensKind::StringLiteral,
+                        span: Span { start, end: idx },
+                        id: None
+                    };
+                }
+                _ => {
+                    idx += 1;
+                }
+            }
+        }
+
+        panic!("Lexer Error: Unterminated string literal starting at position {}", start);
+    }
+    #[inline(always)]
+    fn lex_number(&mut self,start: usize,first_byte: u8) -> Token{
+        let mut is_float = false;
+
+        if first_byte == b'0' {
+            match self.stream.peek() {
+                Some(b'x' | b'X') => {
+                    self.stream.advance();
+                    return self.lex_hex_literal(start);
+                },
+                Some(b'b' | b'B') => {
+                    self.stream.advance();
+                    return self.lex_bin_literal(start);
+                },
+                _ => {}
+            }
+        }
+        while let Some(b) = self.stream.peek() {
+            match b { 
+                b'0'..=b'9' => {
+                    self.stream.advance();
+                },
+                b'_' => {
+                    self.stream.advance();
+                },
+                _ => break,
+            }
+        }
+
+        if self.stream.peek() == Some(b'.') {
+            if let Some(next_byte) = self.stream.peek_at(1) {
+                if next_byte.is_ascii_digit() {
+                    is_float = true;
+                    self.stream.advance();
+                    while let Some(b) = self.stream.peek() {
+                        match b {
+                            b'0'..=b'9' | b'_' => {
+                                 self.stream.advance(); 
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        let kind = if is_float {TokensKind::FloatLiteral} else {TokensKind::IntegerLiteral};
+        Token {kind, span: Span {start, end: self.stream.index()}, id: None}
+    }
+    #[inline(always)]
+    fn lex_hex_literal(&mut self, start: usize) -> Token{
+        while let Some(b) = self.stream.peek() {
+            match b {
+                b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'_' => {
+                    self.stream.advance();
+                },
+                _ => break,
+            }
+        }
+        Token { kind: TokensKind::IntegerLiteral, span: Span { start, end: self.stream.index() },id: None }
+    }
+    #[inline(always)]
+    fn lex_bin_literal(&mut self, start: usize) -> Token{
+        while let Some(b) = self.stream.peek() {
+            match b {
+                b'0' | b'1' | b'_' => {
+                    self.stream.advance();
+                },
+                _ => break,
+            }
+        }
+        Token { kind: TokensKind::IntegerLiteral, span: Span { start, end: self.stream.index()}, id: None }
+    } 
+    pub fn lex_identifier_or_keyword(&mut self,start: usize) -> Token {
+        let base = self.stream.initial_ptr;
+        let len = self.stream.length;
+        let mut idx = self.stream.index();
+
+        while idx < len {
+            let b = unsafe { *base.add(idx) };
+            match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => {
+                    idx += 1;
+                }
+                _ => break,
+            }
+        }
+        self.stream.index = idx;
+
+        let raw_bytes = unsafe {
+            std::slice::from_raw_parts(base.add(start), idx - start)
+        };
+        let mut id = None;
+
+        let kind = match raw_bytes {
+            b"if" => TokensKind::KeywordIf,
+            b"else" => TokensKind::KeywordElse,
+            b"while" => TokensKind::KeywordWhile,
+            b"for" => TokensKind::KeywordFor,
+            b"connect" => TokensKind::KeywordConnect,
+            b"mut" => TokensKind::KeywordMutable,
+            b"step" => TokensKind::KeywordStep,
+            b"volatile" => TokensKind::KeywordVolatile,
+            b"Bool" => TokensKind::KeywordBool,
+            b"in" => TokensKind::KeywordIn,
+
+            b"true" => TokensKind::KeywordTrue,
+            b"false" => TokensKind::KeywordFalse,
+
+            b"init" => TokensKind::KeywordInit,
+            b"dec" => TokensKind::KeywordDec,
+            b"returns" => TokensKind::KeywordReturn,
+            b"func" => TokensKind::KeywordFunc,
+            b"structure" => TokensKind::KeywordStructure,
+
+            b"Int64" => TokensKind::KeywordInt64,
+            b"Int32" => TokensKind::KeywordInt32,
+            b"Int16" => TokensKind::KeywordInt16,
+            b"Int8" => TokensKind::KeywordInt8,
+            
+            b"Uint64" => TokensKind::KeywordUint64,
+            b"Uint32" => TokensKind::KeywordUint32,
+            b"Uint16" => TokensKind::KeywordUint16,
+            b"Uint8" => TokensKind::KeywordUint8,
+
+            b"Float64" => TokensKind::KeywordFloat64,
+            b"Float32" => TokensKind::KeywordFloat32,
+            b"Float16" => TokensKind::KeywordFloat16,
+            b"Float8" => TokensKind::KeywordFloat8,
+            _ => {
+                let lexeme = unsafe { std::str::from_utf8_unchecked(raw_bytes) };
+                id = Some(self.interner.intern(lexeme));
+                TokensKind::Identifier
+            },
+        };
+        Token {
+            kind, 
+            span: Span {
+                start,
+                end: idx
+            },
+            id,
+        }
+    }
+}
+use crate::llvm::main_codegen::llvm_codegen::CodegenEnv;
+use llvm_sys::{core::*, prelude::LLVMValueRef}; 
+use crate::llvm::main_codegen::llvm_codegen::LLVMBackend;
+use std::{collections::HashMap, ffi::CString};
+use compiler_frontend::{poison_abstract_syntax_tree_nodes::*, poison_semantic_analyzer::poison_symbol_table::*};
+pub struct LLVMWalkerCodeGenerator {
+    pub backend: LLVMBackend,
+    pub env: CodegenEnv,
+    pub global_functions: HashMap<IdentifierId, LLVMValueRef>,
+}
+impl LLVMWalkerCodeGenerator {
+    pub fn new() -> Self {
+        Self {
+            backend: LLVMBackend::new(),
+            env: CodegenEnv::new(),
+            global_functions: HashMap::new(),
+        }
+    }
+    #[inline(always)]
+    fn make_expression(&self, id: u32, left: LLVMValueRef, right: LLVMValueRef, is_float: bool) -> LLVMValueRef {
+        unsafe {
+            if is_float {
+                match id {
+                    0 => LLVMBuildFAdd(self.backend.builder, left, right, b"fadd_tmp\0".as_ptr() as *const _),
+                    1 => LLVMBuildFSub(self.backend.builder, left, right, b"fsub_tmp\0".as_ptr() as *const _),
+                    2 => LLVMBuildFMul(self.backend.builder, left, right, b"fmul_tmp\0".as_ptr() as *const _),
+                    3 => LLVMBuildFDiv(self.backend.builder, left, right, b"fdiv_tmp\0".as_ptr() as *const _),
+                    _ => std::ptr::null_mut()
+                }
+            } else {
+                match id {
+                    0 => LLVMBuildAdd(self.backend.builder, left, right, b"add_tmp\0".as_ptr() as *const _),
+                    1 => LLVMBuildSub(self.backend.builder, left, right, b"sub_tmp\0".as_ptr() as *const _),
+                    2 => LLVMBuildMul(self.backend.builder, left, right, b"mul_tmp\0".as_ptr() as *const _),
+                    3 => LLVMBuildSDiv(self.backend.builder, left, right, b"div_tmp\0".as_ptr() as *const _),
+                    _ => std::ptr::null_mut()
+                }
+            }
+        }
+    }
+    pub fn walk_expression(&mut self, ast: &Ast, expr_id: ExprId) -> LLVMValueRef{
+        unsafe {
+            let expr = &ast.expressions[expr_id.0 as usize];
+            match expr {
+                Expression::Literal { kind, .. } => {
+                    match kind {
+                        LiteralKind::Integer(val) => {
+                            let i32_ty = self.backend.map_id_to_type(2); 
+                            LLVMConstInt(i32_ty, *val as u64, 1)
+                        }
+                        LiteralKind::Float(val) => {
+                    
+                            let f32_ty = self.backend.map_id_to_type(6);
+                            LLVMConstReal(f32_ty, *val)
+                        }
+                        LiteralKind::Boolean(val) => {
+                            let i8_ty = self.backend.map_id_to_type(4);
+                            LLVMConstInt(i8_ty, if *val { 1 } else { 0 }, 0)
+                        }
+                        LiteralKind::String => {
+                            let string_id = ast.resolved_string_literals.get(&expr_id)
+                                .expect("Codegen Error: Unresolved string literal metadata index.");
+
+                            let string_val = interner.lookup(*string_id).unwrap_or("");
+                            
+                            let c_str = CString::new(string_val).unwrap_or_else(|_| CString::new("").unwrap());
+                            
+                            llvm_sys::core::LLVMBuildGlobalStringPtr(
+                                self.backend.builder,
+                                c_str.as_ptr(),
+                                b"str_lit\0".as_ptr() as *const _,
+                            )
+                        },
+                    }
+                },
+                Expression::Identifier { .. } => {
+                    let name_id = *ast.resolved_expr_identifiers.get_unchecked(expr_id.0 as usize);
+                    
+                    let var_ptr = self.env.lookup(name_id).expect("Codegen Error: Undefined variable lookup.");
+                    
+                    let var_type = LLVMGetAllocatedType(var_ptr);
+                    LLVMBuildLoad2(self.backend.builder, var_type, var_ptr, b"load_tmp\0".as_ptr() as *const _)
+                },
+                Expression::Binary { left, operator, right, .. } => {
+                    let left_val = self.walk_expression(ast, *left);
+                    let right_val = self.walk_expression(ast, *right);
+
+                    let op_id = match operator {
+                        OpKind::Add => 0,
+                        OpKind::Sub => 1,
+                        OpKind::Mul => 2,
+                        OpKind::Div => 3,
+                        _ => 0,
+                    };
+
+                    let is_float = false; 
+
+                    self.make_expression(op_id, left_val, right_val, is_float)
+                },
+                Expression::Unary { operator, right, .. } => {
+                    let right_val = self.walk_expression(ast, *right);
+                    match operator {
+                        OpKind::Sub => {
+                            let zero = LLVMConstInt(LLVMTypeOf(right_val), 0, 1);
+                            LLVMBuildSub(self.backend.builder, zero, right_val, b"neg_tmp\0".as_ptr() as *const _)
+                        }
+                        _ => right_val,
+                    }
+                },
+                Expression::Call { callee, arguments , .. } => {
+                    let callee_expr = ast.expressions.get_unchecked(callee.0 as usize);
+                    
+                    let func_ptr = match callee_expr {
+                        Expression::Identifier { .. } => {
+                            let func_name_id = *ast.resolved_expr_identifiers.get_unchecked(callee.0 as usize);
+                            
+                            // FIX: Pull directly from the global functions registry instead of stack-based env
+                            *self.global_functions.get(&func_name_id)
+                                .expect("Codegen Error: Attempted to call an undefined function.")
+                        }
+                        _ => panic!("Codegen Error: Complex or dynamic function pointers are not supported yet.")
+                    };
+
+                    assert!(!func_ptr.is_null(), "Codegen Error: Target function pointer is null!");
+
+                    // Safely extract the function type signature from the global value pointer
+                    let func_type = unsafe { llvm_sys::core::LLVMGlobalGetValueType(func_ptr) };
+                    assert!(!func_type.is_null(), "Codegen Error: Failed to extract function type signature.");
+
+                    let mut llvm_args = [std::ptr::null_mut(); 16];
+                    let arg_count = arguments.len();
+
+                    if arg_count > 16 {
+                        panic!("Codegen Error: Function call passes {} arguments, exceeding the 16-parameter limit.", arg_count);
+                    }
+
+                    for (i, &arg_id) in arguments.iter().enumerate() {
+                        llvm_args[i] = self.walk_expression(ast, arg_id);
+                    }
+
+                    // Pass std::ptr::null_mut() safely if there are zero arguments to avoid slice-pointer faults
+                    let arg_ptr = if arg_count == 0 { std::ptr::null_mut() } else { llvm_args.as_mut_ptr() };
+
+                    unsafe {
+                        LLVMBuildCall2(
+                            self.backend.builder,
+                            func_type,
+                            func_ptr,
+                            arg_ptr,
+                            arg_count as u32,
+                            b"call_tmp\0".as_ptr() as *const _,
+                        )
+                    }
+                },
+
+            }
+        }
+    }
+    pub fn walk_statement(&mut self, ast: &Ast, stmt_id: StmtId, interner: &Interner) {
+        unsafe {
+            let stmt = &ast.statements[stmt_id.0 as usize];
+            match stmt {
+                Statement::If { condition, then_branch, else_branch, span } => unsafe {
+                    let current_func = self.backend.get_current_function();
+
+                    let check_if_inside_func = current_func.as_ref().expect("Codegen Error: 'if' statement declared outside of a valid function body.");
+                    let cond_value = self.walk_expression(ast, *condition);
+                    let cond_bool = LLVMBuildICmp(
+                        self.backend.builder,
+                        llvm_sys::LLVMIntPredicate::LLVMIntNE,
+                        cond_value,
+                        LLVMConstInt(LLVMTypeOf(cond_value), 0, 0),
+                        b"if_cond_bit\0".as_ptr() as *const _,
+                    );
+
+                    let then_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "then_branch");
+                    let else_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "else_branch");
+                    let merge_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "if_merge");
+
+                    LLVMBuildCondBr(self.backend.builder, cond_bool, then_block, else_block);
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, then_block);
+                    self.env.enter_scope();
+                    for &inner_stmt_id in then_branch {
+                        self.walk_statement(ast, inner_stmt_id, interner);
+                    }
+                    self.env.exit_scope();
+                    if LLVMGetInsertBlock(self.backend.builder) != std::ptr::null_mut() {
+                        LLVMBuildBr(self.backend.builder, merge_block);
+                    }
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, else_block);
+                    self.env.enter_scope();
+                    if let Some(else_stmts) = else_branch {
+                        for &inner_stmt_id in else_stmts {
+                            self.walk_statement(ast, inner_stmt_id, interner);
+                        }
+                    }
+                    self.env.exit_scope();
+                    if LLVMGetInsertBlock(self.backend.builder) != std::ptr::null_mut() {
+                        LLVMBuildBr(self.backend.builder, merge_block);
+                    }
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, merge_block);
+                }
+                Statement::VarDecl {initializer, ..} => {
+                    let initial_value = self.walk_expression(ast, *initializer);
+                    let expected_ty = ast.resolved_var_decl_types.get_unchecked(stmt_id.0 as usize).unwrap_or(Type::I32);
+                    let name_id = *ast.resolved_assignment_targets.get_unchecked(stmt_id.0 as usize);
+
+                    let llvm_ty = self.backend.map_id_to_type(expected_ty.to_backend_id());
+                    let var_name = interner.lookup(name_id).unwrap_or("unnamed_var");
+
+                    let c_var_name = CString::new(var_name).unwrap_or_else(|_| CString::new("unnamed_var").unwrap());
+
+                    let var_ptr = self.backend.var_emitter.make_variable(
+                        self.backend.builder, 
+                        llvm_ty, 
+                        c_var_name.as_ptr(),
+                        initial_value
+                    );
+                    
+                    
+                    self.env.insert(name_id, var_ptr);
+                }
+                Statement::While { condition, body, span } => unsafe {
+                    let current_func = self.backend.get_current_function();
+                    
+                    let check_if_inside_func = current_func.as_ref()
+                                .expect("Codegen Error: 'while' loop declared outside of a valid function body.");
+
+                    let loop_cond_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "while_cond");
+                    let loop_body_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "while_body");
+                    let loop_end_block = self.backend.ctrl_emitter.append_block(self.backend.context, current_func, "while_end");
+
+                    LLVMBuildBr(self.backend.builder, loop_cond_block);
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, loop_cond_block);
+                    let cond_value = self.walk_expression(ast, *condition);
+                    let cond_boolean = LLVMBuildICmp(
+                        self.backend.builder, 
+                        llvm_sys::LLVMIntPredicate::LLVMIntNE, 
+                        cond_value, 
+                        LLVMConstInt(LLVMTypeOf(cond_value), 0, 0), 
+                        b"w_bit\0".as_ptr() as *const _
+                    );
+                    LLVMBuildCondBr(self.backend.builder, cond_boolean, loop_body_block, loop_end_block);
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, loop_body_block);
+                    self.env.enter_scope();
+                    for &inner_stmt_id in body {
+                        self.walk_statement(ast, inner_stmt_id, interner);
+                    }
+                    self.env.exit_scope();
+                    
+                    if LLVMGetInsertBlock(self.backend.builder) != std::ptr::null_mut() {
+                        LLVMBuildBr(self.backend.builder, loop_cond_block);
+                    }
+
+                    LLVMPositionBuilderAtEnd(self.backend.builder, loop_end_block);
+                }
+
+                Statement::Assignment { target, operator, value, span } => {
+                    let new_value = self.walk_expression(ast, *value);
+
+                    let target_name_id = ast.resolved_assignment_targets[stmt_id.0 as usize];
+
+                    let var_ptr = self.env.lookup(target_name_id).unwrap_or_else(|| {
+                        panic!("Poison.CodegenError: Attempted to assign to an undefined variable.");
+                    });
+
+                    match operator {
+                        OpKind::Assign => {
+                            LLVMBuildStore(self.backend.builder, new_value, var_ptr);
+                        }
+                        _ => {
+                            panic!("Poison.CodegenError: Compound assignments are not implemented yet.");
+                        }
+                    }
+                }
+                Statement::Function { body, .. } => {
+                    let func_name_id = ast.resolved_function_names
+                        .get(stmt_id.0 as usize)
+                        .copied()
+                        .expect("Poison.CodegenError: Missing function name ID");
+
+                    let params_meta = ast.resolved_function_params
+                        .get(stmt_id.0 as usize)
+                        .expect("Poison.CodegenError: Missing function parameters metadata");
+                    let func_name = interner.lookup(func_name_id).unwrap_or("unnamed_func");
+                    
+                    let mut param_types = [std::ptr::null_mut(); 64];
+                    let mut param_names = [""; 64]; 
+
+                    if params_meta.len() > 64 {
+                        panic!("Poison.CodegenError: Function '{}' exceeds the 64 parameter limit.", func_name);
+                    }
+
+                    for (i, &(param_id, ty)) in params_meta.iter().enumerate() {
+                        param_types[i] = self.backend.map_id_to_type(ty.to_backend_id());
+                        param_names[i] = interner.lookup(param_id).unwrap_or("param");
+                    }
+
+                    let return_type: Type = ast.resolved_var_decl_types
+                        .get(stmt_id.0 as usize)
+                        .and_then(|inner_option| inner_option.clone()) // Extracts the inner Option<Type>
+                        .unwrap_or(Type::Void);
+
+                    let llvm_ret_ty: *mut llvm_sys::LLVMType = self.backend.map_id_to_type(return_type.to_backend_id());
+
+                    let (function, entry_block) = self.backend.func_emitter.add_function(
+                        self.backend.module,
+                        self.backend.context,
+                        self.backend.builder,
+                        llvm_ret_ty,
+                        &mut param_types[..params_meta.len()],
+                        &param_names[..params_meta.len()],
+                        func_name
+                    );
+
+                    // Make sure the builder is properly placed at the entry block
+                    LLVMPositionBuilderAtEnd(self.backend.builder, entry_block);
+
+
+                    // This leaves the function registered in the global scope frame forever.
+                    self.global_functions.insert(func_name_id, function);
+                    
+                    self.env.enter_scope();
+                    
+                    let c_param_names: Vec<CString> = param_names[..params_meta.len()]
+                        .iter()
+                        .map(|&p_name| CString::new(p_name).unwrap_or_else(|_| CString::new("param").unwrap()))
+                        .collect();
+
+                    for (i, &(param_id, ty)) in params_meta.iter().enumerate() {
+                        let llvm_param_val = LLVMGetParam(function, i as u32);
+                        let llvm_param_ty = param_types[i];
+                        
+                        let var_ptr = self.backend.var_emitter.make_variable(
+                            self.backend.builder,
+                            llvm_param_ty,
+                            c_param_names[i].as_ptr(),
+                            llvm_param_val
+                        );
+                        
+                        self.env.insert(param_id, var_ptr);
+                    }
+
+                    for &inner_stmt_id in body {
+                        self.walk_statement(ast, inner_stmt_id, interner); 
+                    }
+                    
+                    drop(c_param_names);
+                    self.env.exit_scope();
+                }
+
+
+                Statement::Return{value, ..} => {
+                    if let Some(expr_id) = value {
+                        let return_val = self.walk_expression(ast, *expr_id);
+                        
+                        LLVMBuildRet(self.backend.builder, return_val);
+                    } else {
+                        LLVMBuildRetVoid(self.backend.builder);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(unused)]
+
+use std::{cell::RefCell, rc::Rc};
+
+use crate::{
+    poison_abstract_syntax_tree_nodes::*, poison_lexer::Lexer, poison_parser::Parser, poison_semantic_analyzer::poison_symbol_table::*, poison_tokens::*
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SemaError {
+    UnknownType { name: IdentifierId, span: Span },
+    TypeMismatch { expected: Type, found: Type, span: Span },
+    DuplicateDeclaration { name: IdentifierId, span: Span },
+    CannotInferType { span: Span },
+    UndefinedVariable { name: IdentifierId, span: Span },
+    DuplicateParameters{ name: IdentifierId, span: Span },
+    DuplicateVariable {  name: IdentifierId, span: Span }
+}
+
+pub struct SemanticAnalyzer {
+    pub symbol_table: SymbolTable,
+    pub expected_return_type: Option<Type>
+}
+// the start of my insanity
+
+impl SemanticAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            symbol_table: SymbolTable::new(),
+            expected_return_type: None,
+        }
+    }
+    pub fn analyze_statement(
+        &mut self,
+        ast: &Ast, 
+        stmt_id: StmtId, 
+        in_function: bool
+    ) -> Result<(), SemaError> {
+        let stmt = &ast.statements[stmt_id.0 as usize];
+        match stmt {
+            Statement::While { condition, body, span } => {
+                let cond_ty = self.analyze_expression(ast, *condition)?;
+                if cond_ty != Type::Bool {
+                    return Err(SemaError::TypeMismatch { 
+                        expected: Type::Bool, 
+                        found: cond_ty, 
+                        span: unsafe { ast.expressions.get_unchecked(condition.0 as usize).span() } 
+                    });
+                }
+                for &inner_stmt_id in body {
+                    self.analyze_statement(ast, inner_stmt_id, in_function)?;
+                }
+                Ok(())
+            },
+            Statement::Function { body, return_type, span, .. } => {
+                let expected_return_type = if return_type.is_some() {
+                    ast.resolved_var_decl_types[stmt_id.0 as usize].unwrap_or(Type::Void)
+                } else {
+                    Type::Void
+                };
+                
+                let old_return_context = self.expected_return_type;
+                self.expected_return_type = Some(expected_return_type);
+
+                let func_name_id = ast.resolved_function_names[stmt_id.0 as usize];
+                let func_symbol = Symbol {
+                    name: func_name_id,
+                    symbol_type: expected_return_type,
+                    is_mutable: false,
+                };
+                let _ = self.symbol_table.insert(func_symbol);
+
+                self.symbol_table.enter_scope();
+                
+                let params = &ast.resolved_function_params[stmt_id.0 as usize];
+                for &(param_id, final_param_type) in params {
+                    let param_symbol = Symbol {
+                        name: param_id,
+                        symbol_type: final_param_type,
+                        is_mutable: false,
+                    };
+
+                    self.symbol_table.insert(param_symbol).map_err(|_| SemaError::DuplicateParameters {
+                        name: param_id,
+                        span: *span,
+                    })?;
+                }
+
+                for &inner_stmt_id in body {
+                    self.analyze_statement(ast, inner_stmt_id, true)?;
+                }
+
+                self.symbol_table.exit_scope();
+                self.expected_return_type = old_return_context;
+                Ok(())
+            },
+            Statement::Assignment { target, value, span, .. } => {
+                let target_id = ast.resolved_assignment_targets[stmt_id.0 as usize];
+                
+                let target_symbol = self.symbol_table.lookup(target_id)
+                    .map_err(|_| SemaError::UndefinedVariable { name: target_id, span: *span })?;
+                let expected_ty = target_symbol.symbol_type;
+
+                let value_ty = self.analyze_expression(ast, *value)?;
+
+                if expected_ty != value_ty {
+                    return Err(SemaError::TypeMismatch { expected: expected_ty, found: value_ty, span: *span });
+                }
+                Ok(())
+            },
+            Statement::Return { value, span } => {
+                if !in_function {
+                    return Err(SemaError::CannotInferType { span: *span }); 
+                }
+
+                let actual_return_type = match value {
+                    Some(expr_id) => self.analyze_expression(ast, *expr_id)?,
+                    None => Type::Void,
+                };
+
+                if let Some(expected_ty) = self.expected_return_type {
+                    if actual_return_type != expected_ty { 
+                        return Err(SemaError::TypeMismatch {
+                            expected: expected_ty,
+                            found: actual_return_type,
+                            span: *span,
+                        });
+                    }
+                }
+                Ok(())
+            },
+            
+            Statement::Block { statements, span } => {
+                self.symbol_table.enter_scope();
+                for &inner_stmt_id in statements {
+                    self.analyze_statement(ast, inner_stmt_id, in_function)?;
+                }
+                self.symbol_table.exit_scope();
+                Ok(())
+            },
+            Statement::VarDecl { is_init, is_mutable, name, initializer, span, .. } => {
+                let expected_ty = unsafe { 
+                    (*ast.resolved_var_decl_types.get_unchecked(stmt_id.0 as usize))
+                        .ok_or(SemaError::CannotInferType { span: *span })?
+                };
+
+                if *is_init {
+                    let init_ty = self.analyze_expression(ast, *initializer)?;
+                    if expected_ty != init_ty {
+                        return Err(SemaError::TypeMismatch { expected: expected_ty, found: init_ty, span: *span });
+                    }
+                }
+
+                let name_id = unsafe { *ast.resolved_assignment_targets.get_unchecked(stmt_id.0 as usize) };
+
+                let symbol = Symbol {
+                    name: name_id,
+                    symbol_type: expected_ty,
+                    is_mutable: *is_mutable,
+                };
+
+                self.symbol_table.insert(symbol).map_err(|_| SemaError::DuplicateVariable { 
+                    name: name_id, 
+                    span: *name 
+                })?;
+
+                Ok(())
+            }
+            _ => Ok(())
+        }
+    }
+    pub fn analyze_expression(
+        &mut self,
+        ast: &Ast,
+        expr_id: ExprId,
+    ) -> Result<Type, SemaError> {
+        let expr = &ast.expressions[expr_id.0 as usize];        
+        match expr {
+            Expression::Literal { kind, span: _ } => match kind {
+                LiteralKind::Integer(_) => Ok(Type::I32),
+                LiteralKind::Float(_) => Ok(Type::F32),
+                LiteralKind::Boolean(_) => Ok(Type::Bool),
+                LiteralKind::String  => Ok(Type::Str),
+            },
+            Expression::Identifier { span } => {
+                let name_id = unsafe { *ast.resolved_expr_identifiers.get_unchecked(expr_id.0 as usize) };
+                
+                match self.symbol_table.lookup(name_id) {
+                    Ok(symbol) => Ok(symbol.symbol_type),
+                    Err(_) => Err(SemaError::UndefinedVariable { 
+                        name: name_id, 
+                        span: *span 
+                    }),
+                }
+            },
+            Expression::Unary { operator, right, span } => {
+                let right_ty = self.analyze_expression(ast, *right)?;
+
+                match operator {
+                    OpKind::Sub => {
+                        if matches!(right_ty, Type::I32 | Type::I64 | Type::F32 | Type::F64) {
+                            Ok(right_ty)
+                        } else {
+                            Err(SemaError::TypeMismatch {
+                                expected: Type::I32,
+                                found: right_ty,
+                                span: *span,
+                            })
+                        }
+                    }
+                    _ => {
+                        if right_ty == Type::Bool {
+                            Ok(Type::Bool)
+                        } else {
+                            Err(SemaError::TypeMismatch {
+                                expected: Type::Bool,
+                                found: right_ty,
+                                span: *span,
+                            })
+                        }
+                    }
+                }
+            },
+            Expression::Binary { left, operator, right, span } => {
+                let left_ty = self.analyze_expression(ast, *left)?;
+                let right_ty = self.analyze_expression(ast, *right)?;
+
+                if left_ty != right_ty {
+                    return Err(SemaError::TypeMismatch {
+                        expected: left_ty,
+                        found: right_ty,
+                        span: *span,
+                    });
+                }
+
+                match operator {
+                    OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div => Ok(left_ty),
+                    OpKind::Equal | OpKind::NotEqual | OpKind::Less | OpKind::Greater 
+
+                    | OpKind::LessEqual | OpKind::GreaterEqual | OpKind::LogicalAnd | OpKind::LogicalOr => {
+                        Ok(Type::Bool)
+                    }
+                    _ => Err(SemaError::TypeMismatch { 
+                        expected: left_ty, 
+                        found: right_ty, 
+                        span: *span 
+                    })
+                }
+            },
+            Expression::Call { callee, arguments, span } => {
+                let callee_ty = self.analyze_expression(ast, *callee)?;
+            
+                for &arg_id in arguments {
+                    let _arg_ty = self.analyze_expression(ast, arg_id)?;
+                }
+
+                Ok(callee_ty)
+            }
+        }
+    }
+}
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    Void,
+    I64,
+    I32,
+    I16,
+    I8,
+
+    F64,
+    F32,
+    F16,
+    F8,
+
+    U64,
+    U32,
+    U16,
+    U8,
+    Bool,
+    Str,
+    Custom(IdentifierId),
+}
+
+impl Type {
+    pub fn to_backend_id(&self) -> u32 {
+        match self {
+            Type::Void => 0,
+            Type::I64  => 1,
+            Type::I32  => 2,
+            Type::I16  => 3,
+            Type::I8   => 4,
+            
+            Type::F64  => 5,
+            Type::F32  => 6,
+            Type::F16  => 7,
+            Type::F8   => 8,
+            
+            Type::U64  => 1,
+            Type::U32  => 2,
+            Type::U16  => 3,
+            Type::U8   => 4,
+            
+            Type::Bool => 4,
+            
+            Type::Str  => panic!("String type codegen mapping not implemented yet"),
+            Type::Custom(_id) => panic!("Custom types mapping not implemented yet"), 
+        }
+    }
+}
+
+pub struct Symbol {
+    pub name: IdentifierId,
+    pub symbol_type: Type,
+    pub is_mutable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IdentifierId(pub u32);
+
+pub struct SymbolTable {
+    symbols: Vec<Symbol>,
+    scope_markers: Vec<usize>, 
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            symbols: Vec::new(),
+            scope_markers: vec![0], 
+        }
+    }
+
+    pub fn enter_scope(&mut self) {
+        self.scope_markers.push(self.symbols.len());
+    }
+
+    pub fn exit_scope(&mut self) {
+        if self.scope_markers.len() > 1 {
+            if let Some(previous_len) = self.scope_markers.pop() {
+                self.symbols.truncate(previous_len);
+            }
+        }
+    }
+
+    pub fn insert(&mut self, symbol: Symbol) -> Result<(), SymbolTableError>{
+        let current_scope_start = *self.scope_markers.last().unwrap();
+        
+        for existing in self.symbols[current_scope_start..].iter() {
+            if existing.name == symbol.name {
+                return Err(SymbolTableError::DuplicateSymbol { name: symbol.name });
+            }
+        }
+        
+        self.symbols.push(symbol);
+        Ok(())
+    }
+
+    pub fn lookup(&self, name: IdentifierId) -> Result<&Symbol, SymbolTableError>  {
+        for symbol in self.symbols.iter().rev() {
+            if symbol.name == name {
+                return Ok(symbol);
+            }
+        }
+        Err(SymbolTableError::SymbolNotFound { name })
+    }
+}
+
+pub struct Interner {
+    map: HashMap<&'static str, IdentifierId>,
+    storage: Vec<Box<str>>,
+}
+
+impl Interner {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            storage: Vec::new(),
+        }
+    }
+
+    pub fn intern(&mut self, name: &str) -> IdentifierId {
+        if let Some(&id) = self.map.get(name) {
+            return id;
+        }
+        let permanent_box: Box<str> = name.into();
+        let ptr: *const str = &*permanent_box;
+    
+        let static_ref: &'static str = unsafe { &*ptr };
+
+        let id = IdentifierId(self.storage.len() as u32);
+
+        self.storage.push(permanent_box);
+        self.map.insert(static_ref, id.clone());
+
+        id
+    }
+
+    pub fn lookup(&self, id: IdentifierId) -> Option<&str> {
+        self.storage.get(id.0 as usize).map(|b| b.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolTableError {
+    DuplicateSymbol { name: IdentifierId },
+    SymbolNotFound { name: IdentifierId },
+    ScopeUnderflow,
+}
+use crate::{poison_semantic_analyzer::poison_symbol_table::{IdentifierId, Type}, poison_tokens::{Span, Token}};
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExprId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StmtId(pub u32);
+
+#[derive(Debug)]
+pub enum Statement {
+    Expression(ExprId),
+    Block {
+        statements: Vec<StmtId>,
+        span: Span,
+    },
+    Structure {
+        name: Span,
+        fields: Vec<StructField>,
+        span: Span,
+    },
+    Function {
+        name: Span,
+        parameters: Vec<Param>, // Holds parameter identifier spans
+        body: Vec<StmtId>,
+        return_type: Option<Span>, // FIX: Holds the optional return type span (like 'i32')
+        attribute: Option<Span>,   // FIX: Holds the attribute span (like 'gpu' or 'main')
+        span: Span,
+    },
+    VarDecl {
+        is_init: bool, 
+        is_mutable: bool,
+        name: Span,
+        explicit_type: Option<Span>,
+        initializer: ExprId,
+        span: Span,
+    },
+    While{
+        condition: ExprId,
+        body: Vec<StmtId>,
+        span: Span,
+    },
+    For {
+        variable: Span,
+        range_start: ExprId,
+        range_end: ExprId,
+        is_inclusive: bool,
+        step_by: ExprId,
+        body: Vec<StmtId>,
+        span: Span,
+    },
+    Assignment {
+        target: Span,
+        operator: OpKind,
+        value: ExprId,
+        span: Span,
+    },
+    Return {
+        value: Option<ExprId>,
+        span: Span,
+    },
+    Connect {
+        target: Span,
+        span: Span,
+    },
+    If {
+        condition: ExprId, 
+        then_branch: Vec<StmtId>,
+        else_branch: Option<Vec<StmtId>>,
+        span: Span,
+    },
+}
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: Span,
+    pub param_type: Span,
+}
+#[derive(Debug)]
+pub enum Expression {
+    Literal {
+        kind: LiteralKind,
+        span: Span,
+    },
+    Identifier {
+        span: Span,
+    },
+    Binary {
+        left: ExprId,
+        operator: OpKind,
+        right: ExprId,
+        span: Span,
+    },
+    Call {
+        callee: ExprId,
+        arguments: Vec<ExprId>,
+        span: Span,
+    },
+    Unary {
+        operator: OpKind,
+        right: ExprId,
+        span: Span,
+    },
+}
+impl Expression {
+    pub fn span(&self) -> Span {
+        match self {
+            Expression::Literal { span, .. } => *span,
+            Expression::Identifier { span } => *span,
+            Expression::Binary { span, .. } => *span,
+            Expression::Call { span, .. } => *span,
+            Expression::Unary { span, .. } => *span,
+        }
+    }
+}
+
+pub struct Identifier {
+    pub span: Span,
+}
+#[derive(Debug)]
+pub struct StructField {
+    pub name: Span,
+    pub field_type: Span,
+    pub span: Span,
+}
+#[derive(Debug)]
+pub enum LiteralKind {
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    String,
+}
+#[derive(Debug)]
+pub enum OpKind {
+    Add, Sub, Mul, Div,
+    Equal, NotEqual, Less, Greater,
+    LessEqual, GreaterEqual, LogicalAnd,
+    AddressOf,
+    LogicalOr,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    Assign,
+}
+
+
+
+pub struct Ast {
+    pub statements: Vec<Statement>,
+    pub expressions: Vec<Expression>,
+    pub root_statements: Vec<StmtId>, 
+
+    pub resolved_string_literals: HashMap<ExprId, IdentifierId>, 
+    pub resolved_expr_identifiers: Vec<IdentifierId>,
+    pub resolved_var_decl_types: Vec<Option<Type>>,
+    pub resolved_assignment_targets: Vec<IdentifierId>,
+    pub resolved_function_names: Vec<IdentifierId>,
+    pub resolved_function_params: Vec<Vec<(IdentifierId, Type)>>,
+}
+impl Ast {
+    pub fn print_tree(&self, source: &str) {
+        println!("--- ABSTRACT SYNTAX TREE ---");
+        for &stmt_id in &self.root_statements {
+            self.print_statement(source, stmt_id, 0);
+        }
+        println!("----------------------------");
+    }
+
+    fn print_statement(&self, source: &str, stmt_id: StmtId, indent: usize) {
+        let pad = "  ".repeat(indent);
+        let stmt = &self.statements[stmt_id.0 as usize];
+
+        match stmt {
+            Statement::Function { name, parameters, body, return_type, .. } => {
+                let func_name = &source[name.start..name.end];
+                let ret_ty = return_type.map_or("void", |span| &source[span.start..span.end]);
+                
+                println!("{pad}Function: @{func_name} (returns {ret_ty})");
+                
+                // Print Parameters
+                for param in parameters {
+                    let p_name = &source[param.name.start..param.name.end];
+                    let p_type = &source[param.param_type.start..param.param_type.end];
+                    println!("{pad}  Param: {p_name} : {p_type}");
+                }
+                
+                // Print Inner Body Block Elements
+                println!("{pad}  Body:");
+                for &inner_stmt_id in body {
+                    self.print_statement(source, inner_stmt_id, indent + 2);
+                }
+            }
+            Statement::VarDecl { is_init, is_mutable, name, explicit_type, initializer, .. } => {
+                let var_name = &source[name.start..name.end];
+                let mut_str = if *is_mutable { "mut " } else { "" };
+                let ty_str = explicit_type.map_or("Inferred".to_string(), |span| source[span.start..span.end].to_string());
+                
+                println!("{pad}VarDecl: {mut_str}{var_name} ({ty_str})");
+                if *is_init {
+                    println!("{pad}  Initializer:");
+                    self.print_expression(source, *initializer, indent + 2);
+                }
+            }
+            Statement::Assignment { target, operator, value, .. } => {
+                let var_name = &source[target.start..target.end];
+                println!("{pad}Assignment: {var_name} ({:?})", operator);
+                self.print_expression(source, *value, indent + 1);
+            }
+            Statement::Return { value, .. } => {
+                println!("{pad}Return");
+                if let Some(expr_id) = value {
+                    self.print_expression(source, *expr_id, indent + 1);
+                }
+            }
+            Statement::Block { statements, .. } => {
+                println!("{pad}Block:");
+                for &inner_stmt_id in statements {
+                    self.print_statement(source, inner_stmt_id, indent + 1);
+                }
+            }
+            Statement::If { condition, then_branch, else_branch, .. } => {
+                println!("{pad}If Condition:");
+                self.print_expression(source, *condition, indent + 1);
+                println!("{pad}Then Branch:");
+                for &stmt in then_branch { self.print_statement(source, stmt, indent + 1); }
+                if let Some(else_stmts) = else_branch {
+                    println!("{pad}Else Branch:");
+                    for &stmt in else_stmts { self.print_statement(source, stmt, indent + 1); }
+                }
+            }
+            Statement::While { condition, body, .. } => {
+                println!("{pad}While Loop Condition:");
+                self.print_expression(source, *condition, indent + 1);
+                println!("{pad}While Body:");
+                for &stmt in body { self.print_statement(source, stmt, indent + 1); }
+            }
+            Statement::Expression(expr_id) => {
+                self.print_expression(source, *expr_id, indent);
+            }
+            _ => println!("{pad}Unknown/Unimplemented Statement Node"),
+        }
+    }
+
+    fn print_expression(&self, source: &str, expr_id: ExprId, indent: usize) {
+        let pad = "  ".repeat(indent);
+        let expr = &self.expressions[expr_id.0 as usize];
+
+        match expr {
+            Expression::Literal { kind, .. } => {
+                println!("{pad}Literal: {:?}", kind);
+            }
+            Expression::Identifier { span } => {
+                let text = &source[span.start..span.end];
+                println!("{pad}Identifier: {text}");
+            }
+            Expression::Binary { left, operator, right, .. } => {
+                println!("{pad}BinaryOp: {:?}", operator);
+                self.print_expression(source, *left, indent + 1);
+                self.print_expression(source, *right, indent + 1);
+            }
+            Expression::Unary { operator, right, .. } => {
+                println!("{pad}UnaryOp: {:?}", operator);
+                self.print_expression(source, *right, indent + 1);
+            }
+            Expression::Call { callee, arguments, .. } => {
+                println!("{pad}FunctionCall:");
+                println!("{pad}  Callee:");
+                self.print_expression(source, *callee, indent + 2);
+                println!("{pad}  Arguments:");
+                for &arg_id in arguments {
+                    self.print_expression(source, arg_id, indent + 2);
+                }
+            }
+        }
+    }
+        #[inline(always)]
+    fn resolve_type_bytes(source: &str, type_span: &Span) -> Type {
+        let type_bytes = unsafe { 
+            source.as_bytes().get_unchecked(type_span.start as usize..type_span.end as usize) 
+        };
+        match type_bytes {
+            b"Int64"   => Type::I64, b"Int32"   => Type::I32, b"Int16"   => Type::I16, b"Int8"    => Type::I8,
+            b"Float64" => Type::F64, b"Float32" => Type::F32, b"Float16" => Type::F16, b"Float8"  => Type::F8,
+            b"Uint64"  => Type::U64, b"Uint32"  => Type::U32, b"Uint16"  => Type::U16, b"Uint8"   => Type::U8,
+            b"Bool"    => Type::Bool, b"String"  => Type::Str,
+            _ => Type::Void, 
+        }
+    }
+
+    pub fn prepare_caches(&mut self, source: &str, tokens: &[Token]) {
+        self.resolved_expr_identifiers.resize(self.expressions.len(), IdentifierId(0));
+        self.resolved_var_decl_types.resize(self.statements.len(), None);
+        self.resolved_assignment_targets.resize(self.statements.len(), IdentifierId(0));
+        self.resolved_function_names.resize(self.statements.len(), IdentifierId(0));
+        self.resolved_function_params.resize(self.statements.len(), Vec::new());
+
+        for (idx, expr) in self.expressions.iter().enumerate() {
+            if let Expression::Identifier { span } = expr {
+                if let Some(tok) = tokens.iter().find(|t| t.span.start == span.start) {
+                    if let Some(pre_interned_id) = tok.id {
+                        self.resolved_expr_identifiers[idx] = pre_interned_id;
+                    }
+                }
+            }
+        }
+
+        for (idx, stmt) in self.statements.iter().enumerate() {
+            match stmt {
+                Statement::VarDecl { name, explicit_type, .. } => {
+                    if let Some(type_span) = explicit_type {
+                        self.resolved_var_decl_types[idx] = Some(Self::resolve_type_bytes(source, type_span));
+                    }
+                    if let Some(tok) = tokens.iter().find(|t| t.span.start == name.start) {
+                        if let Some(pre_interned_id) = tok.id {
+                            self.resolved_assignment_targets[idx] = pre_interned_id;
+                        }
+                    }
+                }
+                Statement::Assignment { target, .. } => {
+                    if let Some(tok) = tokens.iter().find(|t| t.span.start == target.start) {
+                        if let Some(pre_interned_id) = tok.id {
+                            self.resolved_assignment_targets[idx] = pre_interned_id;
+                        }
+                    }
+                }
+                Statement::Function { name, parameters, return_type, .. } => {
+                    if let Some(type_span) = return_type {
+                        self.resolved_var_decl_types[idx] = Some(Self::resolve_type_bytes(source, type_span));
+                    }
+
+                    if let Some(tok) = tokens.iter().find(|t| t.span.start == name.start) {
+                        if let Some(pre_interned_id) = tok.id {
+                            self.resolved_function_names[idx] = pre_interned_id;
+                        }
+                    }
+                    
+                    let mut cached_params = Vec::with_capacity(parameters.len());
+                    for param in parameters {
+                        let mut p_id = IdentifierId(0);
+                        if let Some(tok) = tokens.iter().find(|t| t.span.start == param.name.start) {
+                            if let Some(pre_interned_id) = tok.id {
+                                p_id = pre_interned_id;
+                            }
+                        }
+                        let p_ty = Self::resolve_type_bytes(source, &param.param_type);
+                        cached_params.push((p_id, p_ty));
+                    }
+                    self.resolved_function_params[idx] = cached_params;
+                }
+                Statement::For { variable, .. } => {
+                    if let Some(tok) = tokens.iter().find(|t| t.span.start == variable.start) {
+                        if let Some(pre_interned_id) = tok.id {
+                            self.resolved_assignment_targets[idx] = pre_interned_id;
+                        }
+                    }
+                }
+                Statement::Structure { name, fields, .. } => {
+                    if let Some(tok) = tokens.iter().find(|t| t.span.start == name.start) {
+                        if let Some(pre_interned_id) = tok.id {
+                            self.resolved_function_names[idx] = pre_interned_id;
+                        }
+                    }
+                    
+                    let mut cached_fields = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        let mut f_id = IdentifierId(0);
+                        if let Some(tok) = tokens.iter().find(|t| t.span.start == field.name.start) {
+                            if let Some(pre_interned_id) = tok.id {
+                                f_id = pre_interned_id;
+                            }
+                        }
+                        let f_ty = Self::resolve_type_bytes(source, &field.field_type);
+                        cached_fields.push((f_id, f_ty));
+                    }
+                    self.resolved_function_params[idx] = cached_fields;
+                }
+                Statement::Connect { target, .. } => {
+                    if let Some(tok) = tokens.iter().find(|t| t.span.start == target.start) {
+                        if let Some(pre_interned_id) = tok.id {
+                            self.resolved_assignment_targets[idx] = pre_interned_id;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            statements: Vec::with_capacity(1024),
+            expressions: Vec::with_capacity(2024),
+            root_statements: Vec::with_capacity(64),
+            resolved_string_literals: HashMap::new(),
+                
+            resolved_expr_identifiers: Vec::new(),
+            resolved_var_decl_types: Vec::new(),
+            resolved_assignment_targets: Vec::new(),
+            resolved_function_names: Vec::new(),
+            resolved_function_params: Vec::new(),
+        }
+    }
+    #[inline(always)]
+    pub fn add_statement(&mut self, stmt: Statement) -> StmtId{
+        let id = self.statements.len() as u32;
+        self.statements.push(stmt);
+        StmtId(id)
+    }
+    #[inline(always)]
+    pub fn register_root(&mut self, id: StmtId) {
+        self.root_statements.push(id);
+    }
+    #[inline(always)]
+    pub fn add_expression(&mut self, expr: Expression) -> ExprId{
+        let id = self.expressions.len() as u32;
+        self.expressions.push(expr);
+        ExprId(id)
+    }
+}

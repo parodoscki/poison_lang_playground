@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "driver",
+    "compiler_frontend",
+    "compiler_backend",
+    "lib_helper",
+]
+resolver = "4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

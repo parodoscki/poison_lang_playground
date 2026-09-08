@@ -1,0 +1,11 @@
+[package]
+name = "driver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "driver"
+
+[dependencies]
+compiler_frontend = { path = "../compiler_frontend" }
+compiler_backend = { path = "../compiler_backend" }

@@ -1,1 +1,4 @@
-/target
+/target/
+project_POISON/target/
+lib_helper/target/
+**/*.rs.bk

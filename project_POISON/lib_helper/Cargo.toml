@@ -1,0 +1,11 @@
+[package]
+name = "lib_helper"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lib_helper"
+
+[dependencies]
+compiler_frontend = { path = "../compiler_frontend" }
+compiler_backend = { path = "../compiler_backend" }
