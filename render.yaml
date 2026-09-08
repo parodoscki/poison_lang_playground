@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: psn-compiler-api
-    runtime: rust
-    buildCommand: |
-      sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
-      cargo build --release --bin compiler_server
-    startCommand: ./target/release/compiler_server
