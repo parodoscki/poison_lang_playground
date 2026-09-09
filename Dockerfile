@@ -3,9 +3,9 @@ FROM rust:1.98-bookworm as builder
 
 # 2. Add the official LLVM repository explicitly and install LLVM 22
 RUN apt-get update && apt-get install -y wget lsb-release software-properties-common gnupg \
+    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/apt.llvm.org.gpg \
     && echo "deb http://llvm.org llvm-toolchain-bookworm-22 main" >> /etc/apt/sources.list \
     && echo "deb-src http://llvm.org llvm-toolchain-bookworm-22 main" >> /etc/apt/sources.list \
-    && wget -O - https://llvm.org | apt-key add - \
     && apt-get update \
     && apt-get install -y llvm-22-dev libclang-22-dev clang-22 \
     && rm -rf /var/lib/apt/lists/*
@@ -24,8 +24,8 @@ FROM debian:bookworm-slim
 
 # 6. Install the stable runtime system libraries matching the builder stage
 RUN apt-get update && apt-get install -y wget gnupg lsb-release software-properties-common \
+    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/apt.llvm.org.gpg \
     && echo "deb http://llvm.org llvm-toolchain-bookworm-22 main" >> /etc/apt/sources.list \
-    && wget -O - https://llvm.org | apt-key add - \
     && apt-get update \
     && apt-get install -y libllvm22 \
     && rm -rf /var/lib/apt/lists/*
